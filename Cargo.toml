@@ -1,0 +1,26 @@
+[package]
+name = "rstmqtt"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "An MQTT explorer: browse, inspect and publish messages on a broker"
+repository = "https://github.com/stroblme/rstmqtt"
+
+[dependencies]
+base64 = "0.23.1"
+chrono = "0.4"
+eframe = { version = "0.36.2", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "persistence",
+    "wayland",
+    "x11",
+] }
+rumqttc = "0.25.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "3.2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+[dev-dependencies]
+rumqttd = "0.20.0"
