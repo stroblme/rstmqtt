@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! rstmqtt -- an MQTT explorer: every topic on a broker as a live tree, with
-//! message inspection, history and publishing.
+//! MQTT explorer with a live topic tree, message inspection, history and publishing.
 
 mod gui;
 mod mqtt;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Connection profiles and the session: one tokio task per connection that
-//! feeds every received message into the shared topic tree.
+//! Connection profiles and sessions, with one Tokio task per connection updating
+//! the shared topic tree.
 
 use std::hash::{BuildHasher, RandomState};
 use std::sync::{Arc, Mutex};
@@ -15,22 +15,18 @@ use tokio::task::JoinHandle;
 
 use crate::tree::{Message, Props, Tree};
 
-/// The largest packet MQTT allows (256 MiB). rumqttc's default of 10 KiB drops
-/// the connection on any bigger packet, and a retained one then comes back
-/// after every reconnect, so any limit below what the broker accepts can lock a
-/// session in a reconnect loop. The broker bounds it in practice (mosquitto's
-/// `message_size_limit`), and rumqttc only allocates what a packet needs.
+/// MQTT packet size limit, avoiding reconnect loops from retained packets above
+/// rumqttc's 10 KiB default. The broker limits messages; allocation follows packet size.
 const MAX_PACKET: u32 = 268_435_455;
 
-/// Requests the session task has not sent yet. Clearing a subtree publishes
-/// once per retained topic in a single frame, so this leaves room for
-/// hundreds; beyond that `publish` returns an error.
+/// Pending request capacity, sized for subtree clears that publish once per topic.
+/// `publish` returns an error when the queue is full.
 // ponytail: a queue that is full at a reconnect also drops the re-sent
 // subscriptions, which takes QUEUE publishes while offline; have the GUI
 // publish only while connected if that shows.
 const QUEUE: usize = 1024;
 
-/// Wait before polling again after a connection error.
+/// Polling delay after a connection error.
 const RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +35,7 @@ pub enum Version {
     V5,
 }
 
-/// Persisted by the GUI via eframe storage; never holds a password.
+/// Connection settings persisted by eframe, excluding passwords.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
@@ -49,10 +45,10 @@ pub struct Profile {
     pub version: Version,
     pub client_id: String,
     pub username: String,
-    /// Seconds.
+    /// Keep-alive interval in seconds.
     pub keep_alive: u16,
     pub clean: bool,
-    /// Topic filter and QoS.
+    /// Subscription pairs of topic filter and QoS.
     pub subscriptions: Vec<(String, u8)>,
 }
 
@@ -77,7 +73,7 @@ impl Default for Profile {
 pub enum State {
     Connecting,
     Connected,
-    /// The last connection error; the session retries every second.
+    /// Last connection error; retries every second.
     Reconnecting(String),
     Disconnected,
 }
@@ -92,8 +88,7 @@ enum Client {
     V5(rumqttc::v5::AsyncClient),
 }
 
-/// One connection to a broker. Dropping it disconnects, so no connection
-/// outlives its session.
+/// Broker connection that disconnects when dropped.
 pub struct Session {
     pub shared: Arc<Mutex<Shared>>,
     client: Client,
@@ -101,8 +96,8 @@ pub struct Session {
 }
 
 impl Session {
-    /// Connects in the background; `shared.state` tells how that goes. Must be
-    /// called inside a tokio runtime context.
+    /// Connects in the background, reporting progress through `shared.state`.
+    /// Requires a Tokio runtime context.
     pub fn start(
         profile: &Profile,
         password: Option<&str>,
@@ -168,10 +163,8 @@ impl Session {
         }
     }
 
-    /// Queues a message without waiting for it to go out. `props` are ignored
-    /// on v3.1.1; on v5 their content type and user properties are sent.
-    /// It does not lock `shared`, so a subtree clear can call it while walking
-    /// the tree under that lock.
+    /// Queues a message without waiting or locking `shared`.
+    /// MQTT v5 sends content type and user properties; v3.1.1 ignores `props`.
     pub fn publish(
         &self,
         topic: &str,
@@ -214,16 +207,15 @@ impl Session {
         Ok(())
     }
 
-    /// Best-effort clean DISCONNECT, then the task ends; the state becomes
-    /// `Disconnected`. The same as dropping the session.
+    /// Drops the session, setting `Disconnected` and attempting a clean DISCONNECT.
     pub fn disconnect(self) {
         drop(self);
     }
 }
 
 impl Drop for Session {
-    /// Queues a DISCONNECT if there is a connection to end, after which the
-    /// task stops by itself; otherwise the task is stopped right away.
+    /// Attempts to queue DISCONNECT when connected so the task exits.
+    /// Aborts the task if DISCONNECT cannot be queued.
     fn drop(&mut self) {
         let state = std::mem::replace(&mut self.shared.lock().unwrap().state, State::Disconnected);
         let queued = state == State::Connected
@@ -237,7 +229,7 @@ impl Drop for Session {
     }
 }
 
-/// Feeds a v3.1.1 connection into `shared` until the session is dropped.
+/// Updates `shared` from an MQTT v3.1.1 connection until the session ends.
 async fn run_v4(
     mut eventloop: rumqttc::EventLoop,
     client: rumqttc::AsyncClient,
@@ -290,8 +282,8 @@ async fn run_v4(
     }
 }
 
-/// Feeds a v5 connection into `shared` until the session is dropped. The topic
-/// alias maximum stays 0, so the broker never sends an empty, aliased topic.
+/// Updates `shared` from an MQTT v5 connection until the session ends.
+/// Topic aliases stay disabled to prevent empty aliased topic names.
 async fn run_v5(
     mut eventloop: rumqttc::v5::EventLoop,
     client: rumqttc::v5::AsyncClient,
@@ -364,10 +356,9 @@ mod tests {
 
     use super::*;
 
-    /// The port of an in-process rumqttd for `version`, shared by the tests.
-    /// Each version gets its own broker, because rumqttd panics forwarding a v5
-    /// message with properties to a v3.1.1 client, and its v3.1.1 listener
-    /// refuses everyone after that.
+    /// Returns the shared test broker port for `version`.
+    /// Separate brokers avoid a rumqttd panic when forwarding v5 properties to
+    /// v3.1.1 clients, which leaves its v3.1.1 listener rejecting connections.
     fn broker(version: Version) -> u16 {
         static PORTS: OnceLock<[u16; 2]> = OnceLock::new();
         let ports = PORTS.get_or_init(|| {
@@ -424,7 +415,7 @@ mod tests {
         true
     }
 
-    /// A connected session on the test broker.
+    /// Connects a session to the test broker.
     fn connect(version: Version) -> Session {
         let profile = Profile {
             host: Ipv4Addr::LOCALHOST.to_string(),
@@ -442,7 +433,7 @@ mod tests {
         session
     }
 
-    /// The latest message on `topic`, once there is one.
+    /// Returns the latest message on `topic`, if any.
     fn latest(session: &Session, topic: &str) -> Option<Message> {
         let shared = session.shared.lock().unwrap();
         let id = shared.tree.find(topic)?;

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The window: the topic tree, the selected topic's details and the publish
-//! form beside it, the connection in the top bar and counters in the status
-//! bar. Settings and the window geometry are persisted by eframe into the
-//! platform config directory.
+//! Topic tree, message details, publish form, connection controls and status bar.
+//! eframe persists settings and window geometry.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -22,7 +20,7 @@ use crate::mqtt::{Profile, Session, Shared, State, Version};
 use crate::payload::{self, Change, Seg, View};
 use crate::tree::{Node, Props, ROOT, Tree};
 
-/// The flat dark palette of rsttherm and rstptz, plus state and diff colours.
+/// Flat dark palette shared with rsttherm and rstptz, plus state and diff colours.
 mod pal {
     use eframe::egui::Color32;
 
@@ -34,45 +32,43 @@ mod pal {
     pub const TEXT: Color32 = Color32::from_rgb(0xE4, 0xE7, 0xEC);
     pub const MUTED: Color32 = Color32::from_rgb(0x8B, 0x91, 0x9E);
     pub const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x8D, 0xFF);
-    /// Connected, and added diff lines.
+    /// Connected state and added diff lines.
     pub const GOOD: Color32 = Color32::from_rgb(0x4C, 0xC3, 0x8A);
     pub const WARN: Color32 = Color32::from_rgb(0xF5, 0xA5, 0x24);
-    /// Errors, and removed diff lines.
+    /// Errors and removed diff lines.
     pub const BAD: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 }
 
 const GAP: f32 = 8.0;
 const PAD: f32 = 14.0;
-/// A tree row; tighter than a button, since a tree is scanned rather than
-/// clicked through.
+/// Tree row height, tighter than buttons for scanning.
 const ROW: f32 = 26.0;
-/// Per tree level.
+/// Indentation per tree level.
 const INDENT: f32 = 16.0;
-/// Starting width of the details panel; the user can drag it.
+/// Initial width of the resizable details panel.
 const DETAILS: f32 = 480.0;
 const MODAL: f32 = 380.0;
-/// Most the payload editor grows to before it scrolls.
+/// Maximum payload editor height before scrolling.
 const PAYLOAD: f32 = 160.0;
-/// Text fields in a modal, right of their label.
+/// Modal text field width.
 const FIELD: f32 = 220.0;
-/// How long a changed topic stays highlighted.
+/// Topic change highlight duration.
 const FLASH: Duration = Duration::from_secs(1);
-/// How long a note stays in the status bar.
+/// Status note duration.
 const NOTE: Duration = Duration::from_secs(3);
-/// Rendered text beyond this is cut until "Show all": a galley of a few
-/// megabytes takes a while to lay out and paint.
+/// Rendered text byte limit until "Show all", to bound layout and paint cost.
 const LIMIT: usize = 64 * 1024;
-/// Characters of a value in a tree row; the row clips the rest anyway.
+/// Character limit for topic row previews.
 const PREVIEW: usize = 120;
 /// Publish history length.
 const RECENT: usize = 20;
 /// Messages kept per topic.
 const HISTORY: usize = 100;
-/// Seconds of message rate in the status bar's pulse line.
+/// Message rate history length in seconds.
 const PULSE: usize = 60;
-/// Padding inside text fields, so they stand as tall as the buttons beside them.
+/// Text field padding to match button height.
 const INPUT: egui::Margin = egui::Margin::symmetric(8, 6);
-/// Icon buttons, from egui's bundled emoji-icon-font.
+/// Button icons from egui's bundled emoji font.
 const COPY: &str = "🗐";
 const EDIT: &str = "✏";
 const PLUG: &str = "🔌";
@@ -96,7 +92,7 @@ impl Default for Settings {
     }
 }
 
-/// The publish form, and an entry of its history.
+/// Publish form data and publish history entry.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct Draft {
@@ -104,12 +100,12 @@ struct Draft {
     payload: String,
     qos: u8,
     retain: bool,
-    /// v5 only, like `user`.
+    /// MQTT v5 only, as is `user`.
     content_type: String,
     user: Vec<(String, String)>,
 }
 
-/// Runs the window until it is closed.
+/// Runs the GUI until the window closes.
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -127,7 +123,7 @@ pub fn run() -> eframe::Result {
     )
 }
 
-/// Inter and the flat dark palette, as in rsttherm.
+/// Applies Inter fonts and the flat dark palette used by rsttherm.
 fn theme(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -195,40 +191,38 @@ fn theme(ctx: &egui::Context) {
     });
 }
 
-/// The bold family registered by `theme`.
+/// Returns the semibold font family registered by `theme`.
 fn semibold() -> FontFamily {
     FontFamily::Name("semibold".into())
 }
 
 struct App {
     s: Settings,
-    /// The tree on screen: the session's, or the last one's after a disconnect.
+    /// Displayed session data, retained after disconnecting.
     shared: Arc<Mutex<Shared>>,
     session: Option<Session>,
-    /// In memory only, until passwords go to the keyring.
+    /// Password kept in memory only.
     password: String,
-    /// Connect (`true`) or disconnect once the frame has let go of `shared`,
-    /// since ending a session locks it.
+    /// Pending connect (`true`) or disconnect, deferred until the frame releases
+    /// `shared` because ending a session locks it.
     pending: Option<bool>,
-    /// The profile being edited in the connection modal.
+    /// Profile being edited in the connection modal.
     editing: Option<Profile>,
-    /// A subtree's topic and the retained topics in it, waiting for the user
-    /// to confirm clearing them.
+    /// Subtree path and retained topics awaiting confirmation to clear.
     confirm: Option<(String, Vec<String>)>,
     filter: String,
     selected: Option<usize>,
-    /// The history entry shown, by its number among the topic's messages, so
-    /// it stays put while new ones arrive; `None` follows the latest.
+    /// Displayed message number, stable as new messages arrive; `None` follows
+    /// the latest.
     entry: Option<u64>,
     diff: bool,
     show_all: bool,
-    /// Scroll the selection into view, after a key moved it.
+    /// Scrolls the selection into view after keyboard navigation.
     scroll: bool,
     draft: Draft,
-    /// Inline under the publish form.
+    /// Error shown below the publish form.
     publish_error: Option<String>,
-    /// Messages per second, from the root's counter sampled about once a
-    /// second; the newest last.
+    /// Message rates sampled from the root counter about once per second, newest last.
     pulse: VecDeque<f32>,
     counted: u64,
     sampled: Instant,
@@ -289,7 +283,7 @@ impl App {
         self.editing.is_some() || self.confirm.is_some()
     }
 
-    /// Selects `id`, and makes it the publish topic if it is a new selection.
+    /// Selects `id` and updates the publish topic when the selection changes.
     fn select(&mut self, tree: &Tree, id: usize) {
         if self.selected != Some(id) {
             self.selected = Some(id);
@@ -312,10 +306,8 @@ impl App {
         }
     }
 
-    /// Ctrl+C copies the value shown, Ctrl+Shift+C the topic. egui-winit turns
-    /// both into `Event::Copy` rather than key presses, which text fields and
-    /// selected label text answer as well, so this only acts when neither
-    /// holds a selection.
+    /// Handles `Event::Copy`: Ctrl+C copies the displayed value; Ctrl+Shift+C the topic.
+    /// Skips focused text fields, selected label text and open modals.
     fn shortcuts(&mut self, ctx: &egui::Context, tree: &Tree) {
         let Some(shift) = ctx.input(|i| {
             i.events
@@ -390,7 +382,7 @@ impl App {
         });
     }
 
-    /// The message rate over the last `PULSE` seconds, scaled to its peak.
+    /// Draws the last `PULSE` seconds of message rate, scaled to the peak.
     fn pulse_line(&self, ui: &mut Ui) {
         let (rect, _) = ui.allocate_exact_size(vec2(160.0, 14.0), Sense::hover());
         let peak = self.pulse.iter().copied().fold(1.0, f32::max);
@@ -406,7 +398,7 @@ impl App {
         ui.painter().line(points, Stroke::new(1.5, pal::ACCENT));
     }
 
-    /// The filter and the tree rows; returns whether a highlight is fading.
+    /// Draws the filter and topic rows; returns whether any highlight is fading.
     fn topics(&mut self, ui: &mut Ui, tree: &mut Tree, connected: bool) -> bool {
         let filter = ui.add(
             TextEdit::singleline(&mut self.filter)
@@ -525,9 +517,8 @@ impl App {
         fading
     }
 
-    /// Up/Down move the selection, Left/Right collapse and expand (Left on a
-    /// closed node goes to its parent), Enter toggles. Returns whether a node
-    /// opened or closed.
+    /// Up/Down select rows; Left/Right collapse/expand; Enter toggles expansion.
+    /// Left on a closed node selects its parent. Returns whether expansion changed.
     fn keys(&mut self, ui: &Ui, tree: &mut Tree, rows: &[(usize, usize)]) -> bool {
         if ui.ctx().text_edit_focused() || self.modal_open() || rows.is_empty() {
             return false;
@@ -617,8 +608,7 @@ impl App {
         }
     }
 
-    /// Publishes an empty retained message to each topic. The broker passes
-    /// the clear on, and that removes the topics from the tree.
+    /// Publishes empty retained messages to clear topics via broker delivery.
     fn clear(&mut self, topics: &[String]) {
         let Some(session) = &self.session else { return };
         let errors: Vec<String> = topics
@@ -636,7 +626,7 @@ impl App {
         self.notify(note);
     }
 
-    /// The selected topic: where it sits, its value, and its history.
+    /// Displays the selected topic's path, value and history.
     fn inspect(&mut self, ui: &mut Ui, tree: &Tree) {
         let Some(id) = self.selected else {
             ui.label(muted("Select a topic to see its messages."));
@@ -747,7 +737,7 @@ impl App {
         }
     }
 
-    /// The topic's levels, each selecting its node when clicked.
+    /// Displays topic levels as clickable node selections.
     fn breadcrumb(&mut self, ui: &mut Ui, tree: &Tree, id: usize) {
         let mut levels = Vec::new();
         let mut at = id;
@@ -788,7 +778,7 @@ impl App {
         });
     }
 
-    /// Selectable monospace text, cut after [`LIMIT`] bytes until "Show all".
+    /// Displays selectable monospace text, capped at [`LIMIT`] bytes until "Show all".
     fn text_block(&mut self, ui: &mut Ui, parts: Vec<(String, Color32)>, wrap: bool) {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let total: usize = parts.iter().map(|(t, _)| t.len()).sum();
@@ -825,8 +815,7 @@ impl App {
         }
     }
 
-    /// `value`'s members as a collapsible tree; right-click one to copy its
-    /// path or value.
+    /// Displays a collapsible JSON tree; right-click to copy paths or values.
     fn json_tree<'a>(&mut self, ui: &mut Ui, value: &'a Value, path: &mut Vec<Seg<'a>>) {
         let members: Vec<(String, Seg<'a>, &'a Value)> = match value {
             Value::Object(map) => map
@@ -1155,7 +1144,7 @@ impl App {
     }
 }
 
-/// The v5 properties that are set, one per row.
+/// Displays set MQTT v5 properties, one per row.
 fn properties(ui: &mut Ui, p: &Props) {
     egui::Grid::new("props")
         .num_columns(2)
@@ -1190,8 +1179,8 @@ fn properties(ui: &mut Ui, p: &Props) {
         });
 }
 
-/// A topic's latest message, or the one picked from its history; `None`
-/// without messages.
+/// Returns the selected history index, falling back to the latest message.
+/// Returns `None` when history is empty.
 fn shown(node: &Node, entry: Option<u64>) -> Option<usize> {
     let latest = node.history.len().checked_sub(1)?;
     // Message number `n` sits `received - n` entries before the latest, unless
@@ -1212,7 +1201,7 @@ fn state_label(state: &State) -> (&'static str, Color32) {
     }
 }
 
-/// Text in `font`, coloured part by part.
+/// Builds a text layout with `font` and per-part colours.
 fn job(font: &FontId, parts: Vec<(String, Color32)>) -> LayoutJob {
     let mut job = LayoutJob::default();
     for (text, colour) in parts {
@@ -1319,7 +1308,7 @@ fn heading(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).family(semibold()).color(pal::MUTED));
 }
 
-/// A label, and its widget against the right edge.
+/// Displays a label and a right-aligned widget.
 fn field(ui: &mut Ui, label: &str, widget: impl egui::Widget) -> egui::Response {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -1328,7 +1317,7 @@ fn field(ui: &mut Ui, label: &str, widget: impl egui::Widget) -> egui::Response 
     .inner
 }
 
-/// A modal padded like the panels.
+/// Creates a modal with panel padding.
 fn modal(ctx: &egui::Context, id: &str) -> egui::Modal {
     egui::Modal::new(egui::Id::new(id))
         .frame(egui::Frame::popup(&ctx.global_style()).inner_margin(PAD))
@@ -1338,8 +1327,7 @@ fn right_to_left() -> egui::Layout {
     egui::Layout::right_to_left(egui::Align::Center)
 }
 
-/// One row, filled from the right edge. A bare right-to-left layout would
-/// take all the height there is and centre itself in it.
+/// Lays out a single row from the right, avoiding full-height vertical centering.
 fn right_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.horizontal(|ui| ui.with_layout(right_to_left(), add).inner)
         .inner

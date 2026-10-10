@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Every topic seen on the broker as a tree of levels, each with its recent
-//! messages. Nodes live in one arena and are addressed by index, so the GUI can
-//! hold on to a selection while the session task keeps inserting.
+//! Topic tree with per-topic message history. Arena indices keep GUI selections
+//! stable as the session inserts nodes.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
@@ -10,22 +9,22 @@ use std::time::Instant;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
-/// The arena index of the root, which has no name and no messages.
+/// Index of the root, which has no name or messages.
 pub const ROOT: usize = 0;
 
-/// One received publish, the same for v3.1.1 and v5.
+/// Received MQTT publish for v3.1.1 or v5.
 #[derive(Clone, Debug)]
 pub struct Message {
     pub payload: Vec<u8>,
     pub qos: u8,
     pub retain: bool,
-    /// When it arrived here; an MQTT message carries no timestamp of its own.
+    /// Local receipt time; MQTT provides no message timestamp.
     pub time: DateTime<Local>,
     /// MQTT v5 only.
     pub props: Option<Box<Props>>,
 }
 
-/// The v5 publish properties worth showing.
+/// MQTT v5 publish properties shown in the GUI.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Props {
     pub content_type: Option<String>,
@@ -34,32 +33,31 @@ pub struct Props {
     pub correlation: Option<Vec<u8>>,
     /// Message expiry interval in seconds.
     pub expiry: Option<u32>,
-    /// Payload format indicator: the sender says the payload is UTF-8.
+    /// Whether the sender marks the payload as UTF-8.
     pub utf8: Option<bool>,
 }
 
-/// One topic level, and the topic it ends if it has had a message.
+/// Topic level with its children and any messages received on its full path.
 pub struct Node {
-    /// This level of the topic; empty for the empty levels in `/a` or `a//b`.
+    /// Level name; may be empty, as in `/a` or `a//b`.
     pub name: String,
     /// The root is its own parent.
     pub parent: usize,
-    /// Keyed by name, so they come out sorted.
+    /// Child indices sorted by name.
     pub children: BTreeMap<String, usize>,
-    /// Oldest first, at most the tree's cap long.
+    /// Recent messages, oldest first, limited to the tree's cap.
     pub history: VecDeque<Message>,
-    /// Messages on this topic, including those dropped from `history`.
+    /// Total messages received on this topic, including evicted messages.
     pub received: u64,
-    /// Messages on this topic and every topic below it.
+    /// Total messages received in this subtree, including this topic.
     pub subtree_messages: u64,
-    /// Topics at or below this node that have had a message.
+    /// Topics in this subtree that have received a message.
     pub subtree_topics: u32,
-    /// Last message here, for the change highlight.
+    /// Last receipt time on this topic, used for highlighting.
     pub updated: Instant,
-    /// Last message here or anywhere below, so a collapsed parent can flash
-    /// too.
+    /// Last receipt time in this subtree, used to highlight collapsed parents.
     pub subtree_updated: Instant,
-    /// Shown open in the tree view; ignored while a filter is active.
+    /// Whether the node is expanded; ignored while filtering.
     pub expanded: bool,
 }
 
@@ -80,18 +78,17 @@ impl Node {
     }
 }
 
-/// Every topic seen so far, as an arena of [`Node`]s with the root at [`ROOT`].
+/// Topic arena of [`Node`]s rooted at [`ROOT`].
 pub struct Tree {
     nodes: Vec<Node>,
     /// Messages kept per topic.
     cap: usize,
-    /// Payload bytes in all histories, kept as a running total so the status
-    /// bar doesn't have to walk the tree.
+    /// Running total of history payload bytes for the status bar.
     bytes: usize,
 }
 
 impl Tree {
-    /// An empty tree that keeps the last `cap` messages of each topic.
+    /// Creates an empty tree retaining the latest `cap` messages per topic.
     pub fn new(cap: usize) -> Self {
         Self {
             nodes: vec![Node::new(String::new(), ROOT)],
@@ -100,25 +97,24 @@ impl Tree {
         }
     }
 
-    /// Panics if `id` didn't come from this tree.
+    /// Returns the node at `id`; panics if the index is out of bounds.
     pub fn node(&self, id: usize) -> &Node {
         &self.nodes[id]
     }
 
-    /// For the GUI, which opens and closes nodes.
+    /// Returns a mutable node for GUI expansion changes.
     pub fn node_mut(&mut self, id: usize) -> &mut Node {
         &mut self.nodes[id]
     }
 
-    /// Payload bytes held in all histories.
+    /// Returns the total payload bytes in all histories.
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// Files `msg` under `topic`, creating the levels it needs, and returns the
-    /// topic's node. An empty payload on a topic with nothing below it removes
-    /// the topic instead, as MQTT Explorer does: that is how a retained message
-    /// is cleared, and the broker passes the clear on to every subscriber.
+    /// Inserts `msg` under `topic`, creating missing levels, and returns its node.
+    /// Empty payloads remove leaf topics and return `None`, matching retained
+    /// message clearing in MQTT Explorer; branches keep the empty message.
     pub fn insert(&mut self, topic: &str, msg: Message) -> Option<usize> {
         if msg.payload.is_empty() {
             match self.find(topic) {
@@ -161,20 +157,20 @@ impl Tree {
         Some(id)
     }
 
-    /// The node of exactly this topic, if it has been seen.
+    /// Returns the node index for the exact topic path, if present.
     pub fn find(&self, topic: &str) -> Option<usize> {
         topic.split('/').try_fold(ROOT, |id, level| {
             self.nodes[id].children.get(level).copied()
         })
     }
 
-    /// Whether `id` is still in the tree. A selection can outlive its node when
-    /// the topic is cleared.
+    /// Checks whether `id` is still attached to the tree; excludes the root.
+    /// Selections can outlive cleared topics.
     pub fn contains(&self, id: usize) -> bool {
         id != ROOT && self.find(&self.path(id)) == Some(id)
     }
 
-    /// The full topic of `id`, as it was given to `insert`; empty for the root.
+    /// Returns the full topic path of `id`, or an empty string for the root.
     pub fn path(&self, id: usize) -> String {
         let mut levels = Vec::new();
         let mut id = id;
@@ -186,8 +182,7 @@ impl Tree {
         levels.join("/")
     }
 
-    /// `id` and everything below it, each node before its children and
-    /// siblings in name order.
+    /// Returns `id` and its descendants in preorder, with siblings sorted by name.
     pub fn subtree(&self, id: usize) -> Vec<usize> {
         let mut ids = Vec::new();
         let mut stack = vec![id];
@@ -198,11 +193,9 @@ impl Tree {
         ids
     }
 
-    /// Drops `id` and everything below it, then each ancestor that is left
-    /// with neither children nor messages of its own. A topic inserted again
-    /// afterwards starts from scratch. The dropped ids still index a node, so a
-    /// stale selection doesn't panic; removing one again, or the root, does
-    /// nothing.
+    /// Removes `id` and its descendants, then prunes ancestors with no children
+    /// or messages. Reinserting a topic starts fresh. Removed indices remain
+    /// valid for stale selections; removing them again or the root does nothing.
     // ponytail: the slots stay in the arena, so it grows with every clear; add a
     // free list or compact it if long sessions with many clears show the growth.
     pub fn remove(&mut self, id: usize) {
@@ -235,10 +228,9 @@ impl Tree {
         }
     }
 
-    /// The tree view's rows as `(id, depth)`, top to bottom, without the root.
-    /// With an empty `filter` only expanded nodes are opened. Otherwise the
-    /// `expanded` flags are ignored, and a node is shown if its topic or latest
-    /// value contains `filter`, ignoring case, or if something below it is.
+    /// Returns visible `(id, depth)` rows in display order, excluding the root.
+    /// An empty `filter` respects expansion flags. Otherwise, shows case-insensitive
+    /// topic or latest-value matches and their ancestors, ignoring expansion.
     // ponytail: O(n) per call while filtering; cache the match set per tree
     // generation if 100k+ topics stutter.
     pub fn rows(&self, filter: &str) -> Vec<(usize, usize)> {
@@ -251,9 +243,8 @@ impl Tree {
         rows
     }
 
-    /// Adds the rows of `id` and below, and returns whether there were any.
-    /// `path` comes in as the lowercased topic of `id`'s parent and goes out
-    /// unchanged.
+    /// Appends visible rows in `id`'s subtree and returns whether any matched.
+    /// `path` is the parent's lowercase topic path and is restored before returning.
     fn walk(
         &self,
         id: usize,
@@ -291,7 +282,7 @@ impl Tree {
     }
 }
 
-/// Drops the oldest messages beyond `cap` and returns their payload bytes.
+/// Evicts the oldest messages beyond `cap` and returns their total payload bytes.
 fn evict(history: &mut VecDeque<Message>, cap: usize) -> usize {
     let excess = history.len().saturating_sub(cap);
     history.drain(..excess).map(|m| m.payload.len()).sum()
@@ -444,7 +435,7 @@ mod tests {
         assert_eq!(tree.rows(""), [(a, 0), (e, 0)]);
     }
 
-    /// Everything collapsed.
+    /// Creates a sample tree with all nodes collapsed.
     fn house() -> Tree {
         let mut tree = Tree::new(10);
         tree.insert("home/kitchen/temp", msg("21.5"));

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Turning payload bytes into something to read: text, pretty JSON, hex and
-//! base64, JSON paths for copying, and line diffs between two messages.
+//! Payload rendering as text, pretty JSON, hex or base64, plus JSON paths and line diffs.
 
 use std::fmt::Write;
 
@@ -11,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 
-/// How a payload is shown. `Auto` picks one of the others per message.
+/// Payload display format. `Auto` detects the format per message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum View {
     Auto,
@@ -35,10 +34,9 @@ impl View {
     }
 }
 
-/// Picks the view a payload reads best in.
+/// Selects JSON for objects and arrays, text for other UTF-8, or hex for binary.
 ///
-/// Only objects and arrays count as JSON: a sensor value like `21.4` or `true`
-/// is valid JSON too, but a tree with a single leaf is no use.
+/// JSON scalars stay as text to avoid a single-leaf tree.
 pub fn detect(payload: &[u8]) -> View {
     match serde_json::from_slice(payload) {
         Ok(Value::Object(_) | Value::Array(_)) => View::Json,
@@ -47,7 +45,7 @@ pub fn detect(payload: &[u8]) -> View {
     }
 }
 
-/// The payload as `view` shows it, which is also what "copy value" copies.
+/// Renders the payload in `view` for display and "Copy value".
 pub fn render(payload: &[u8], view: View) -> String {
     match view {
         View::Auto => render(payload, detect(payload)),
@@ -62,7 +60,7 @@ pub fn render(payload: &[u8], view: View) -> String {
     }
 }
 
-/// A `hexdump -C` style dump, minus its trailing offset line.
+/// Formats a `hexdump -C` style dump without the trailing offset line.
 fn hex(payload: &[u8]) -> String {
     let lines: Vec<String> = payload
         .chunks(16)
@@ -93,7 +91,7 @@ fn hex(payload: &[u8]) -> String {
     lines.join("\n")
 }
 
-/// The one-line value shown next to a topic in the tree.
+/// Returns a single-line payload preview for a topic row.
 pub fn preview(payload: &[u8], max: usize) -> String {
     let Ok(text) = std::str::from_utf8(payload) else {
         return format!("<{} bytes>", payload.len());
@@ -113,17 +111,16 @@ pub fn preview(payload: &[u8], max: usize) -> String {
     out
 }
 
-/// A step into a JSON value: an object key or an array index.
+/// JSON path segment: an object key or array index.
 #[derive(Clone, Copy, Debug)]
 pub enum Seg<'a> {
     Key(&'a str),
     Index(usize),
 }
 
-/// The path to a JSON node in the usual `a.b[0].c` notation, for "copy path".
+/// Formats a JSON path as `a.b[0].c` for "Copy path".
 ///
-/// Keys that are not identifiers are written as `["x y"]`, quoted and escaped
-/// like a JSON string, so dots or brackets in a key cannot be misread.
+/// Non-identifier keys use JSON-escaped bracket notation, such as `["x y"]`.
 pub fn json_path(segs: &[Seg]) -> String {
     let mut out = String::new();
     for seg in segs {
@@ -149,7 +146,7 @@ fn ident(key: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// What happened to a line between two messages.
+/// Line change between two messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
     Same,
@@ -157,10 +154,9 @@ pub enum Change {
     Removed,
 }
 
-/// A line diff of two rendered messages, every line of both included.
+/// Diffs two rendered messages, including unchanged lines.
 ///
-/// Both sides should be rendered with the same view; for JSON that makes
-/// reordered keys compare equal.
+/// Render both with the same view; JSON rendering ignores object key order.
 pub fn diff(old: &str, new: &str) -> Vec<(Change, String)> {
     TextDiff::from_lines(old, new)
         .iter_all_changes()
