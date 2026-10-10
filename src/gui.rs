@@ -5,6 +5,7 @@
 //! bar. Settings and the window geometry are persisted by eframe into the
 //! platform config directory.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -65,17 +66,20 @@ const LIMIT: usize = 64 * 1024;
 const PREVIEW: usize = 120;
 /// Publish history length.
 const RECENT: usize = 20;
+/// Messages kept per topic.
+const HISTORY: usize = 100;
+/// Seconds of message rate in the status bar's pulse line.
+const PULSE: usize = 60;
 /// Padding inside text fields, so they stand as tall as the buttons beside them.
 const INPUT: egui::Margin = egui::Margin::symmetric(8, 6);
 /// Icon buttons, from egui's bundled emoji-icon-font.
 const COPY: &str = "🗐";
 const EDIT: &str = "✏";
+const PLUG: &str = "🔌";
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
-    /// Messages kept per topic.
-    history: usize,
     profile: Profile,
     view: View,
     /// Published messages, newest first.
@@ -85,7 +89,6 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            history: 100,
             profile: Profile::default(),
             view: View::Auto,
             sent: Vec::new(),
@@ -209,7 +212,6 @@ struct App {
     pending: Option<bool>,
     /// The profile being edited in the connection modal.
     editing: Option<Profile>,
-    settings: bool,
     /// A subtree's topic and the retained topics in it, waiting for the user
     /// to confirm clearing them.
     confirm: Option<(String, Vec<String>)>,
@@ -226,8 +228,8 @@ struct App {
     /// Inline under the publish form.
     publish_error: Option<String>,
     /// Messages per second, from the root's counter sampled about once a
-    /// second.
-    rate: f32,
+    /// second; the newest last.
+    pulse: VecDeque<f32>,
     counted: u64,
     sampled: Instant,
     note: String,
@@ -242,7 +244,7 @@ impl App {
             .unwrap_or_default();
         Self {
             shared: Arc::new(Mutex::new(Shared {
-                tree: Tree::new(s.history),
+                tree: Tree::new(HISTORY),
                 state: State::Disconnected,
             })),
             s,
@@ -250,7 +252,6 @@ impl App {
             password: String::new(),
             pending: None,
             editing: None,
-            settings: false,
             confirm: None,
             filter: String::new(),
             selected: None,
@@ -260,7 +261,7 @@ impl App {
             scroll: false,
             draft: Draft::default(),
             publish_error: None,
-            rate: 0.0,
+            pulse: VecDeque::from(vec![0.0; PULSE]),
             counted: 0,
             sampled: Instant::now(),
             note: String::new(),
@@ -272,12 +273,7 @@ impl App {
         // Ends the old connection before the new one, which may reuse its client
         // id.
         self.session = None;
-        let session = Session::start(
-            &self.s.profile,
-            Some(&self.password),
-            self.s.history,
-            ctx.clone(),
-        );
+        let session = Session::start(&self.s.profile, Some(&self.password), HISTORY, ctx.clone());
         self.shared = session.shared.clone();
         self.session = Some(session);
         self.selected = None;
@@ -290,7 +286,7 @@ impl App {
     }
 
     fn modal_open(&self) -> bool {
-        self.editing.is_some() || self.settings || self.confirm.is_some()
+        self.editing.is_some() || self.confirm.is_some()
     }
 
     /// Selects `id`, and makes it the publish topic if it is a new selection.
@@ -308,7 +304,9 @@ impl App {
         if elapsed >= 1.0 {
             let total = tree.node(ROOT).subtree_messages;
             // Clears lower the count; that is no negative rate.
-            self.rate = total.saturating_sub(self.counted) as f32 / elapsed;
+            self.pulse.pop_front();
+            self.pulse
+                .push_back(total.saturating_sub(self.counted) as f32 / elapsed);
             self.counted = total;
             self.sampled = Instant::now();
         }
@@ -358,24 +356,18 @@ impl App {
                 self.editing = Some(self.s.profile.clone());
             }
             let (text, colour) = state_label(state);
-            let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-            ui.painter().circle_filled(dot.center(), 4.0, colour);
-            let label = ui.label(text);
+            let action = match self.session {
+                Some(_) => "disconnect",
+                None => "connect",
+            };
+            let mut hover = format!("{text}, click to {action}");
             if let State::Reconnecting(error) = state {
-                label.on_hover_text(error);
+                hover = format!("{hover}\n{error}");
             }
-            ui.with_layout(right_to_left(), |ui| {
-                if ui.button("Settings").clicked() {
-                    self.settings = true;
-                }
-                let (text, connect) = match self.session {
-                    Some(_) => ("Disconnect", false),
-                    None => ("Connect", true),
-                };
-                if ui.button(text).clicked() {
-                    self.pending = Some(connect);
-                }
-            });
+            let plug = ui.button(RichText::new(PLUG).color(colour));
+            if plug.on_hover_text(hover).clicked() {
+                self.pending = Some(self.session.is_none());
+            }
         });
     }
 
@@ -386,7 +378,7 @@ impl App {
             state_label(state).0,
             count(root.subtree_messages, "message"),
             count(root.subtree_topics.into(), "topic"),
-            self.rate,
+            self.pulse.back().copied().unwrap_or_default(),
             size(tree.bytes()),
         );
         ui.horizontal(|ui| {
@@ -394,7 +386,24 @@ impl App {
             if self.noted.elapsed() < NOTE {
                 ui.label(RichText::new(&self.note).small());
             }
+            ui.with_layout(right_to_left(), |ui| self.pulse_line(ui));
         });
+    }
+
+    /// The message rate over the last `PULSE` seconds, scaled to its peak.
+    fn pulse_line(&self, ui: &mut Ui) {
+        let (rect, _) = ui.allocate_exact_size(vec2(160.0, 14.0), Sense::hover());
+        let peak = self.pulse.iter().copied().fold(1.0, f32::max);
+        let step = rect.width() / (PULSE - 1) as f32;
+        let points = (self.pulse.iter().enumerate())
+            .map(|(i, r)| {
+                pos2(
+                    rect.left() + i as f32 * step,
+                    rect.bottom() - r / peak * rect.height(),
+                )
+            })
+            .collect();
+        ui.painter().line(points, Stroke::new(1.5, pal::ACCENT));
     }
 
     /// The filter and the tree rows; returns whether a highlight is fading.
@@ -1113,27 +1122,6 @@ impl App {
         }
     }
 
-    fn settings_modal(&mut self, ctx: &egui::Context, tree: &mut Tree) {
-        if !self.settings {
-            return;
-        }
-        let modal = modal(ctx, "settings").show(ctx, |ui| {
-            ui.set_width(MODAL);
-            heading(ui, "Settings");
-            let history = egui::DragValue::new(&mut self.s.history)
-                .range(1..=10_000)
-                .suffix(" messages");
-            if field(ui, "History per topic", history).changed() {
-                tree.set_cap(self.s.history);
-            }
-            ui.add_space(GAP);
-            right_row(ui, |ui| ui.button("Close").clicked())
-        });
-        if modal.inner || modal.should_close() {
-            self.settings = false;
-        }
-    }
-
     fn confirm_modal(&mut self, ctx: &egui::Context) {
         let Some((topic, topics)) = &self.confirm else {
             return;
@@ -1294,7 +1282,6 @@ impl eframe::App for App {
             .show(ui, |ui| self.topics(ui, tree, connected))
             .inner;
         self.connection_modal(&ctx);
-        self.settings_modal(&ctx, tree);
         self.confirm_modal(&ctx);
         drop(guard);
 

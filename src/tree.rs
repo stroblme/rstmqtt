@@ -110,17 +110,6 @@ impl Tree {
         &mut self.nodes[id]
     }
 
-    /// Keeps the last `cap` messages of each topic from now on, and drops the
-    /// older ones right away.
-    pub fn set_cap(&mut self, cap: usize) {
-        self.cap = cap;
-        for node in &mut self.nodes {
-            self.bytes -= evict(&mut node.history, cap);
-            // A lowered cap should hand back the buffer too, not just the payloads.
-            node.history.shrink_to_fit();
-        }
-    }
-
     /// Payload bytes held in all histories.
     pub fn bytes(&self) -> usize {
         self.bytes
@@ -390,22 +379,6 @@ mod tests {
         assert_eq!(tree.node(a).received, 3);
         assert_eq!(tree.bytes(), 5);
         tree.insert("b", msg("4444"));
-        assert_eq!(tree.bytes(), 9);
-    }
-
-    #[test]
-    fn set_cap_trims_existing_histories() {
-        let mut tree = Tree::new(3);
-        let a = tree.insert("a", msg("1")).unwrap();
-        tree.insert("a", msg("22"));
-        tree.insert("a", msg("333"));
-        let b = tree.insert("b", msg("4444")).unwrap();
-        tree.set_cap(1);
-        assert_eq!(payloads(&tree, a), ["333"]);
-        assert_eq!(payloads(&tree, b), ["4444"]);
-        assert_eq!(tree.bytes(), 7);
-        tree.insert("a", msg("55555"));
-        assert_eq!(payloads(&tree, a), ["55555"]);
         assert_eq!(tree.bytes(), 9);
     }
 
