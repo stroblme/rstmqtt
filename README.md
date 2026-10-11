@@ -1,6 +1,6 @@
 # rstmqtt
 
-A desktop MQTT explorer, with:
+A simple but versatile Rust application for debugging MQTT, featuring:
 
 - Live topic tree with filtering and message counters
 - Message inspection, history and diffs
@@ -22,8 +22,7 @@ Or build directly with Cargo:
 cargo build --release
 ```
 
-Rust and Cargo are required. On Linux, `make all` installs missing display libraries
-through the system package manager and may prompt for `sudo` access.
+Rust and Cargo are required. On Linux, `make all` installs missing display libraries through the system package manager and may prompt for `sudo` access.
 
 ## Viewer
 
@@ -45,6 +44,10 @@ click `Connect`. Defaults are `localhost:1883`, MQTT 3.1.1, and subscriptions to
 - Clear retained messages on a topic or across a subtree from the context menu.
 - Copy the displayed value with `Ctrl+C`, or the topic with `Ctrl+Shift+C`.
 
-Connection settings, payload view, publish history and window geometry are remembered
-across restarts. Passwords stay in memory until the app closes; received message
-history is kept only for the current session.
+Connection settings, payload view, publish history and window geometry are remembered across restarts.
+Passwords stay in memory until the app closes; received message history is kept only for the current session.
+
+## Credits
+
+This application is inspired by the wonderful [MQTT Explorer](https://mqtt-explorer.com/).
+The idea of a tree-based message view and the principle application layout originate from "MQTT Explorer". 
