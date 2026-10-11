@@ -3208,6 +3208,7 @@ dependencies = [
  "eframe",
  "rumqttc",
  "rumqttd",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "similar",

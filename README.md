@@ -29,7 +29,7 @@ On Linux, `make all` installs missing display libraries through the system packa
 
 ![Screenshot of the GUI](docs/screenshot-1.png)
 
-Use the edit button in the top bar to configure the broker and subscriptions, then click `Connect`.
+Use the edit button in the top bar to configure the broker (optionally over TLS) and subscriptions, then click `Connect`.
 Defaults are `localhost:1883`, MQTT 3.1.1, and subscriptions to`#` and `$SYS/#` at QoS 0.
 
 - Topic tree with value previews, change highlights and message/topic counters.
@@ -37,14 +37,17 @@ Defaults are `localhost:1883`, MQTT 3.1.1, and subscriptions to`#` and `$SYS/#` 
   `Enter` to expand or collapse.
 - Payload views: Auto, Text, JSON, Hex and Base64. JSON objects and arrays expand
   into a tree; right-click to copy a path or value.
-- Last 100 messages per topic, with a diff against the previous message.
+- Last 100 messages per topic within a 256 MiB memory limit, with a diff against
+  the previous message.
 - Message details: receipt time, size, QoS, retained flag and MQTT 5 properties.
 - Publish with QoS and retain options, JSON formatting and recent-message reuse.
   MQTT 5 also supports content type and user properties.
-- Clear retained messages on a topic or across a subtree from the context menu.
+- Clear retained messages on a topic or across a subtree, or remove topics from
+  view, from the context menu.
 - Copy the displayed value with `Ctrl+C`, or the topic with `Ctrl+Shift+C`.
 
 Connection settings, payload view, publish history and window geometry are remembered across restarts.
+The `Recent` menu can clear the publish history or keep it in memory only.
 Passwords stay in memory until the app closes; received message history is kept only for the current session.
 
 ## Credits
