@@ -22,15 +22,15 @@ Or build directly with Cargo:
 cargo build --release
 ```
 
-Rust and Cargo are required. On Linux, `make all` installs missing display libraries through the system package manager and may prompt for `sudo` access.
+Rust and Cargo are required.
+On Linux, `make all` installs missing display libraries through the system package manager and may prompt for `sudo` access.
 
 ## Viewer
 
 ![Screenshot of the GUI](docs/screenshot-1.png)
 
-Use the edit button in the top bar to configure the broker and subscriptions, then
-click `Connect`. Defaults are `localhost:1883`, MQTT 3.1.1, and subscriptions to
-`#` and `$SYS/#` at QoS 0.
+Use the edit button in the top bar to configure the broker and subscriptions, then click `Connect`.
+Defaults are `localhost:1883`, MQTT 3.1.1, and subscriptions to`#` and `$SYS/#` at QoS 0.
 
 - Topic tree with value previews, change highlights and message/topic counters.
 - Filter topics and latest values with `Ctrl+F`; use arrow keys to navigate and
