@@ -49,5 +49,5 @@ Passwords stay in memory until the app closes; received message history is kept 
 
 ## Credits
 
-This application is inspired by the wonderful [MQTT Explorer](https://mqtt-explorer.com/).
-The idea of a tree-based message view and the principle application layout originate from "MQTT Explorer". 
+Inspired by the wonderful [MQTT Explorer](https://mqtt-explorer.com/) by Thomas Nordquist.
+rstmqtt is an independent implementation. It contains no code or assets from MQTT Explorer and is not affiliated with it.
