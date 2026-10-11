@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Topic tree with per-topic message history. Arena indices keep GUI selections
-//! stable as the session inserts nodes.
+//! stable as the session inserts nodes; removed slots are reused.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use chrono::{DateTime, Local};
@@ -11,6 +11,13 @@ use serde::{Deserialize, Serialize};
 
 /// Index of the root, which has no name or messages.
 pub const ROOT: usize = 0;
+
+/// Approximate memory limit for topics and messages; beyond it the oldest
+/// messages tree-wide are evicted.
+const BUDGET: usize = 256 << 20;
+
+/// Most topic levels kept; messages that would create more are dropped.
+const MAX_NODES: usize = 100_000;
 
 /// Received MQTT publish for v3.1.1 or v5.
 #[derive(Clone, Debug)]
@@ -59,6 +66,9 @@ pub struct Node {
     pub subtree_updated: Instant,
     /// Whether the node is expanded; ignored while filtering.
     pub expanded: bool,
+    /// Whether any message received on this topic had the retain flag; survives
+    /// history eviction.
+    pub retained: bool,
 }
 
 impl Node {
@@ -74,6 +84,7 @@ impl Node {
             updated: Instant::now(),
             subtree_updated: Instant::now(),
             expanded: false,
+            retained: false,
         }
     }
 }
@@ -81,10 +92,24 @@ impl Node {
 /// Topic arena of [`Node`]s rooted at [`ROOT`].
 pub struct Tree {
     nodes: Vec<Node>,
+    /// Removed slots for reuse.
+    free: Vec<usize>,
     /// Messages kept per topic.
     cap: usize,
-    /// Running total of history payload bytes for the status bar.
+    /// [`BUDGET`], lowered by tests.
+    budget: usize,
+    /// Running total of accounted bytes for the status bar.
     bytes: usize,
+    /// Accounted bytes of the nodes alone, which eviction can't reclaim.
+    structure: usize,
+    /// `(receipt time, node)` of each topic's oldest message, for global eviction.
+    // ponytail: wall-clock order, so a clock step back evicts out of arrival
+    // order; key by a message sequence number if that ever matters.
+    oldest: BTreeSet<(DateTime<Local>, usize)>,
+    /// Messages dropped for exceeding the node or memory limit.
+    dropped: u64,
+    /// Inserts and removals so far, for the GUI to notice changes.
+    changes: u64,
 }
 
 impl Tree {
@@ -92,8 +117,14 @@ impl Tree {
     pub fn new(cap: usize) -> Self {
         Self {
             nodes: vec![Node::new(String::new(), ROOT)],
+            free: Vec::new(),
             cap,
+            budget: BUDGET,
             bytes: 0,
+            structure: 0,
+            oldest: BTreeSet::new(),
+            dropped: 0,
+            changes: 0,
         }
     }
 
@@ -107,33 +138,59 @@ impl Tree {
         &mut self.nodes[id]
     }
 
-    /// Returns the total payload bytes in all histories.
+    /// Returns the accounted bytes of all topics and messages, within the budget.
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
+    /// Returns how many messages were dropped for exceeding the node or memory limit.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Returns a count that grows with every insert and removal.
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
     /// Inserts `msg` under `topic`, creating missing levels, and returns its node.
-    /// Empty payloads remove leaf topics and return `None`, matching retained
-    /// message clearing in MQTT Explorer; branches keep the empty message.
+    /// Evicts the oldest messages tree-wide to stay within the memory budget.
+    /// Drops the message and returns `None` if its new levels would exceed the
+    /// node limit, or if it can't fit even after evicting all other messages.
     pub fn insert(&mut self, topic: &str, msg: Message) -> Option<usize> {
-        if msg.payload.is_empty() {
-            match self.find(topic) {
-                Some(id) if self.nodes[id].children.is_empty() => {
-                    self.remove(id);
-                    return None;
-                }
-                None => return None,
-                Some(_) => {}
+        let (mut new, mut grow) = (0, 0);
+        let mut parent = Some(ROOT);
+        for level in topic.split('/') {
+            parent = parent.and_then(|p| self.nodes[p].children.get(level).copied());
+            if parent.is_none() {
+                new += 1;
+                grow += node_cost(level);
             }
         }
+        let live = self.nodes.len() - 1 - self.free.len();
+        if live + new > MAX_NODES || self.structure + grow + cost(&msg) > self.budget {
+            self.dropped += 1;
+            return None;
+        }
+        self.structure += grow;
+        self.bytes += grow;
         let mut path = vec![ROOT];
         let mut id = ROOT;
         for level in topic.split('/') {
             id = match self.nodes[id].children.get(level) {
                 Some(&child) => child,
                 None => {
-                    let child = self.nodes.len();
-                    self.nodes.push(Node::new(level.into(), id));
+                    let node = Node::new(level.into(), id);
+                    let child = match self.free.pop() {
+                        Some(child) => {
+                            self.nodes[child] = node;
+                            child
+                        }
+                        None => {
+                            self.nodes.push(node);
+                            self.nodes.len() - 1
+                        }
+                    };
                     self.nodes[id].children.insert(level.into(), child);
                     child
                 }
@@ -151,9 +208,25 @@ impl Tree {
         let node = &mut self.nodes[id];
         node.received += 1;
         node.updated = now;
-        self.bytes += msg.payload.len();
+        node.retained |= msg.retain;
+        if let Some(m) = node.history.front() {
+            self.oldest.remove(&(m.time, id));
+        }
+        self.bytes += cost(&msg);
         node.history.push_back(msg);
         self.bytes -= evict(&mut node.history, self.cap);
+        self.oldest
+            .extend(node.history.front().map(|m| (m.time, id)));
+        while self.bytes > self.budget
+            && let Some((_, old)) = self.oldest.pop_first()
+        {
+            let history = &mut self.nodes[old].history;
+            self.bytes -= history.pop_front().as_ref().map_or(0, cost);
+            if let Some(m) = history.front() {
+                self.oldest.insert((m.time, old));
+            }
+        }
+        self.changes += 1;
         Some(id)
     }
 
@@ -165,7 +238,7 @@ impl Tree {
     }
 
     /// Checks whether `id` is still attached to the tree; excludes the root.
-    /// Selections can outlive cleared topics.
+    /// Selections can outlive removed topics, whose slots may hold newer topics.
     pub fn contains(&self, id: usize) -> bool {
         id != ROOT && self.find(&self.path(id)) == Some(id)
     }
@@ -194,18 +267,13 @@ impl Tree {
     }
 
     /// Removes `id` and its descendants, then prunes ancestors with no children
-    /// or messages. Reinserting a topic starts fresh. Removed indices remain
-    /// valid for stale selections; removing them again or the root does nothing.
-    // ponytail: the slots stay in the arena, so it grows with every clear; add a
-    // free list or compact it if long sessions with many clears show the growth.
+    /// or messages. Reinserting a topic starts fresh. Freed slots are reused by
+    /// later topics; removing a detached index or the root does nothing.
     pub fn remove(&mut self, id: usize) {
         if !self.contains(id) {
             return;
         }
-        for i in self.subtree(id) {
-            let history = std::mem::take(&mut self.nodes[i].history);
-            self.bytes -= history.iter().map(|m| m.payload.len()).sum::<usize>();
-        }
+        self.changes += 1;
         let node = &self.nodes[id];
         let (messages, topics) = (node.subtree_messages, node.subtree_topics);
         let mut up = id;
@@ -215,6 +283,7 @@ impl Tree {
             node.subtree_messages -= messages;
             node.subtree_topics -= topics;
         }
+        let mut freed = self.subtree(id);
         let mut gone = id;
         loop {
             let parent = self.nodes[gone].parent;
@@ -225,67 +294,111 @@ impl Tree {
                 break;
             }
             gone = parent;
+            freed.push(gone);
+        }
+        for i in freed {
+            let node = &mut self.nodes[i];
+            if let Some(m) = node.history.front() {
+                self.oldest.remove(&(m.time, i));
+            }
+            let size = node_cost(&node.name);
+            self.structure -= size;
+            self.bytes -= size + node.history.iter().map(cost).sum::<usize>();
+            // Detached at the root under an empty name, so `contains` is false.
+            *node = Node::new(String::new(), ROOT);
+            self.free.push(i);
         }
     }
 
     /// Returns visible `(id, depth)` rows in display order, excluding the root.
     /// An empty `filter` respects expansion flags. Otherwise, shows case-insensitive
     /// topic or latest-value matches and their ancestors, ignoring expansion.
-    // ponytail: O(n) per call while filtering; cache the match set per tree
-    // generation if 100k+ topics stutter.
     pub fn rows(&self, filter: &str) -> Vec<(usize, usize)> {
         let filter = filter.to_lowercase();
         let mut rows = Vec::new();
+        // The lowercase topic path of the innermost open level.
         let mut path = String::new();
-        for &child in self.nodes[ROOT].children.values() {
-            self.walk(child, 0, &filter, &mut path, &mut rows);
+        // Open levels as `(parent path length, row, matched, unvisited children)`,
+        // iterative since topics can nest 32,768 levels deep.
+        let mut stack = vec![(0, 0, true, self.nodes[ROOT].children.values())];
+        while let Some((_, _, _, children)) = stack.last_mut() {
+            let Some(&id) = children.next() else {
+                let (len, at, hit, _) = stack.pop().unwrap();
+                path.truncate(len);
+                // Keeps a non-matching level only for matches below it.
+                if !hit && rows.len() == at + 1 {
+                    rows.pop();
+                }
+                continue;
+            };
+            let node = &self.nodes[id];
+            let depth = stack.len() - 1;
+            let len = path.len();
+            if depth > 0 {
+                path.push('/');
+            }
+            path.push_str(&node.name.to_lowercase());
+            let hit = filter.is_empty()
+                || path.contains(&filter)
+                || node
+                    .history
+                    .back()
+                    .is_some_and(|m| contains(&m.payload, &filter));
+            rows.push((id, depth));
+            if node.expanded || !filter.is_empty() {
+                stack.push((len, rows.len() - 1, hit, node.children.values()));
+            } else {
+                path.truncate(len);
+            }
         }
         rows
     }
+}
 
-    /// Appends visible rows in `id`'s subtree and returns whether any matched.
-    /// `path` is the parent's lowercase topic path and is restored before returning.
-    fn walk(
-        &self,
-        id: usize,
-        depth: usize,
-        filter: &str,
-        path: &mut String,
-        rows: &mut Vec<(usize, usize)>,
-    ) -> bool {
-        let node = &self.nodes[id];
-        let len = path.len();
-        if depth > 0 {
-            path.push('/');
-        }
-        path.push_str(&node.name.to_lowercase());
-        let hit = filter.is_empty()
-            || path.contains(filter)
-            || node.history.back().is_some_and(|m| {
-                String::from_utf8_lossy(&m.payload)
-                    .to_lowercase()
-                    .contains(filter)
-            });
-        let at = rows.len();
-        rows.push((id, depth));
-        let mut below = false;
-        if node.expanded || !filter.is_empty() {
-            for &child in node.children.values() {
-                below |= self.walk(child, depth + 1, filter, path, rows);
-            }
-        }
-        path.truncate(len);
-        if !hit && !below {
-            rows.truncate(at);
-        }
-        hit || below
+/// Checks whether `payload` contains the lowercase, non-empty `filter`, ignoring
+/// case. Compares bytes for an ASCII filter rather than copying the payload.
+fn contains(payload: &[u8], filter: &str) -> bool {
+    if filter.is_ascii() {
+        let filter = filter.as_bytes();
+        payload
+            .windows(filter.len())
+            .any(|w| w.eq_ignore_ascii_case(filter))
+    } else {
+        String::from_utf8_lossy(payload)
+            .to_lowercase()
+            .contains(filter)
     }
 }
 
-/// Evicts the oldest messages beyond `cap` and returns their total payload bytes.
+/// Evicts the oldest messages beyond `cap` and returns their accounted bytes.
 fn evict(history: &mut VecDeque<Message>, cap: usize) -> usize {
     let excess = history.len().saturating_sub(cap);
-    history.drain(..excess).map(|m| m.payload.len()).sum()
+    history.drain(..excess).map(|m| cost(&m)).sum()
+}
+
+/// Accounted bytes of a stored message, including its MQTT v5 properties.
+fn cost(msg: &Message) -> usize {
+    let text = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    let props = msg.props.as_deref().map_or(0, |p| {
+        size_of::<Props>()
+            + text(&p.content_type)
+            + text(&p.response_topic)
+            + p.correlation.as_ref().map_or(0, Vec::len)
+            + p.user
+                .iter()
+                .map(|(k, v)| size_of::<(String, String)>() + k.len() + v.len())
+                .sum::<usize>()
+    });
+    size_of::<Message>() + msg.payload.len() + props
+}
+
+/// Accounted bytes of a topic level: the node, its name twice (also the key in
+/// its parent's children) and its entry in the eviction order.
+fn node_cost(name: &str) -> usize {
+    size_of::<Node>()
+        + size_of::<(String, usize)>()
+        + size_of::<(DateTime<Local>, usize)>()
+        + 2 * name.len()
 }
 
 #[cfg(test)]
@@ -314,6 +427,31 @@ mod tests {
     fn counts(tree: &Tree, id: usize) -> (u64, u64, u32) {
         let node = tree.node(id);
         (node.received, node.subtree_messages, node.subtree_topics)
+    }
+
+    fn size(payload: &str) -> usize {
+        cost(&msg(payload))
+    }
+
+    /// Asserts the budget, and that bytes, eviction order and counters match a recount.
+    fn check(tree: &Tree) {
+        assert!(tree.bytes() <= tree.budget);
+        let (mut bytes, mut fronts) = (0, BTreeSet::new());
+        for id in tree.subtree(ROOT) {
+            let node = tree.node(id);
+            if id != ROOT {
+                bytes += node_cost(&node.name);
+            }
+            bytes += node.history.iter().map(cost).sum::<usize>();
+            fronts.extend(node.history.front().map(|m| (m.time, id)));
+            let below = || node.children.values().map(|&c| tree.node(c));
+            let messages: u64 = below().map(|c| c.subtree_messages).sum();
+            let topics: u32 = below().map(|c| c.subtree_topics).sum();
+            assert_eq!(node.subtree_messages, node.received + messages);
+            assert_eq!(node.subtree_topics, u32::from(node.received > 0) + topics);
+        }
+        assert_eq!(tree.bytes(), bytes);
+        assert_eq!(tree.oldest, fronts);
     }
 
     #[test]
@@ -368,9 +506,70 @@ mod tests {
         tree.insert("a", msg("333"));
         assert_eq!(payloads(&tree, a), ["22", "333"]);
         assert_eq!(tree.node(a).received, 3);
-        assert_eq!(tree.bytes(), 5);
+        let bytes = node_cost("a") + size("22") + size("333");
+        assert_eq!(tree.bytes(), bytes);
         tree.insert("b", msg("4444"));
-        assert_eq!(tree.bytes(), 9);
+        assert_eq!(tree.bytes(), bytes + node_cost("b") + size("4444"));
+        check(&tree);
+    }
+
+    #[test]
+    fn evicts_the_oldest_messages_tree_wide_beyond_the_budget() {
+        let mut tree = Tree::new(10);
+        // Room for three topics and five messages.
+        tree.budget = 3 * node_cost("t0") + 5 * size("00");
+        let start = Local::now();
+        for i in 0..30 {
+            let time = start + chrono::TimeDelta::seconds(i);
+            let m = Message {
+                time,
+                ..msg(&format!("{i:02}"))
+            };
+            assert!(tree.insert(&format!("t{}", i % 3), m).is_some());
+            check(&tree);
+        }
+        let mut kept: Vec<_> = tree
+            .subtree(ROOT)
+            .into_iter()
+            .flat_map(|id| payloads(&tree, id))
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["25", "26", "27", "28", "29"]);
+        assert_eq!(counts(&tree, ROOT), (0, 30, 3));
+        assert_eq!(counts(&tree, tree.find("t0").unwrap()), (10, 10, 1));
+        assert_eq!(tree.dropped(), 0);
+    }
+
+    #[test]
+    fn drops_messages_that_cannot_fit() {
+        let mut tree = Tree::new(10);
+        tree.budget = node_cost("a") + size("x");
+        let a = tree.insert("a", msg("x")).unwrap();
+        assert_eq!(tree.insert("a", msg("xx")), None, "too large alone");
+        assert_eq!(tree.insert("b", msg("")), None, "no room for the topic");
+        assert_eq!(tree.find("b"), None);
+        assert_eq!(payloads(&tree, a), ["x"]);
+        assert_eq!(tree.dropped(), 2);
+        check(&tree);
+    }
+
+    #[test]
+    fn drops_messages_beyond_the_node_limit() {
+        let mut tree = Tree::new(10);
+        for i in 0..MAX_NODES {
+            tree.insert(&i.to_string(), msg("x"));
+        }
+        assert_eq!(tree.insert("new", msg("x")), None);
+        assert_eq!(tree.insert("0/new", msg("x")), None);
+        assert_eq!(tree.find("0/new"), None);
+        assert!(
+            tree.insert("0", msg("y")).is_some(),
+            "existing topics still work"
+        );
+        assert_eq!(tree.dropped(), 2);
+        // Removed nodes no longer count.
+        tree.remove(tree.find("0").unwrap());
+        assert!(tree.insert("new", msg("x")).is_some());
     }
 
     #[test]
@@ -406,16 +605,56 @@ mod tests {
         tree.remove(tree.find("a/b").unwrap());
         assert_eq!(counts(&tree, a), (0, 1, 1));
         assert_eq!(counts(&tree, ROOT), (0, 1, 1));
-        assert_eq!(tree.bytes(), 4);
+        let bytes = node_cost("a") + node_cost("e") + size("4444");
+        assert_eq!(tree.bytes(), bytes);
         let c = tree.insert("a/b/c", msg("55555")).unwrap();
         assert_eq!(counts(&tree, c), (1, 1, 1));
         assert_eq!(payloads(&tree, c), ["55555"]);
         assert_eq!(counts(&tree, a), (0, 2, 2));
-        assert_eq!(tree.bytes(), 9);
+        assert_eq!(
+            tree.bytes(),
+            bytes + node_cost("b") + node_cost("c") + size("55555")
+        );
+        check(&tree);
         tree.remove(a);
         assert!(tree.node(ROOT).children.is_empty());
         assert_eq!(counts(&tree, ROOT), (0, 0, 0));
         assert_eq!(tree.bytes(), 0);
+        check(&tree);
+    }
+
+    #[test]
+    fn reuses_removed_slots() {
+        let mut tree = Tree::new(10);
+        tree.insert("keep", msg("1"));
+        for _ in 0..10_000 {
+            let id = tree.insert("a/b/c", msg("2")).unwrap();
+            tree.remove(id);
+            assert!(!tree.contains(id));
+            tree.remove(id);
+        }
+        assert_eq!(tree.nodes.len(), 5);
+        assert_eq!(
+            counts(&tree, ROOT),
+            (0, 1, 1),
+            "a stale remove does nothing"
+        );
+        check(&tree);
+    }
+
+    #[test]
+    fn retained_flag_survives_eviction_but_not_removal() {
+        let mut tree = Tree::new(1);
+        let retained = Message {
+            retain: true,
+            ..msg("1")
+        };
+        let a = tree.insert("a", retained).unwrap();
+        tree.insert("a", msg("2"));
+        assert!(tree.node(a).retained);
+        tree.remove(a);
+        assert_eq!(tree.insert("b", msg("3")), Some(a), "the slot is reused");
+        assert!(!tree.node(a).retained);
     }
 
     #[test]
@@ -463,6 +702,14 @@ mod tests {
     }
 
     #[test]
+    fn filter_ignores_case_beyond_ascii() {
+        let mut tree = Tree::new(10);
+        let a = tree.insert("a", msg("ÄPFEL")).unwrap();
+        assert_eq!(tree.rows("äpf"), [(a, 0)]);
+        assert!(tree.rows("apf").is_empty());
+    }
+
+    #[test]
     fn filter_keeps_ancestors_and_hides_unrelated_branches() {
         let tree = house();
         let [garden, pump, home, hall, door, light] = [
@@ -484,28 +731,36 @@ mod tests {
     }
 
     #[test]
-    fn empty_payload_clears_a_leaf_but_not_a_branch() {
+    fn filters_a_maximum_length_topic() {
+        // 65,535 bytes, the MQTT limit, in 32,768 levels.
+        let topic = "a/".repeat(32767) + "a";
+        let mut tree = Tree::new(10);
+        let leaf = tree.insert(&topic, msg("x")).unwrap();
+        assert_eq!(tree.rows("a").len(), 32768);
+        for id in tree.subtree(ROOT) {
+            tree.node_mut(id).expanded = true;
+        }
+        assert_eq!(tree.rows("").last(), Some(&(leaf, 32767)));
+        assert!(tree.contains(leaf));
+        assert_eq!(tree.path(leaf), topic);
+        tree.remove(leaf);
+        assert!(tree.node(ROOT).children.is_empty());
+        check(&tree);
+    }
+
+    #[test]
+    fn empty_payload_is_kept_like_any_message() {
         let mut tree = Tree::new(10);
         let leaf = tree.insert("a/b/c", msg("1")).unwrap();
-        tree.insert("a", msg("2"));
-        assert_eq!(tree.insert("a/b/c", msg("")), None);
-        assert!(!tree.contains(leaf));
-        assert_eq!(tree.find("a/b"), None, "emptied ancestors go too");
-        tree.remove(leaf);
-        assert_eq!(
-            counts(&tree, ROOT),
-            (0, 1, 1),
-            "a stale remove does nothing"
-        );
-
-        tree.insert("a/x", msg("3"));
-        let a = tree.insert("a", msg("")).unwrap();
-        assert_eq!(
-            payloads(&tree, a),
-            ["2", ""],
-            "a branch keeps the empty message"
-        );
-        assert_eq!(tree.insert("never/seen", msg("")), None);
-        assert_eq!(tree.find("never"), None);
+        let a = tree.insert("a", msg("2")).unwrap();
+        assert_eq!(tree.insert("a/b/c", msg("")), Some(leaf));
+        assert_eq!(payloads(&tree, leaf), ["1", ""]);
+        assert_eq!(tree.insert("a", msg("")), Some(a));
+        assert_eq!(payloads(&tree, a), ["2", ""]);
+        let seen = tree.insert("never/seen", msg("")).unwrap();
+        assert_eq!(payloads(&tree, seen), [""]);
+        assert_eq!(counts(&tree, a), (2, 4, 2));
+        assert_eq!(counts(&tree, ROOT), (0, 5, 3));
+        check(&tree);
     }
 }

@@ -3,12 +3,19 @@
 //! Payload rendering as text, pretty JSON, hex or base64, plus JSON paths and line diffs.
 
 use std::fmt::Write;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
+
+/// Hex dump line length, including the newline.
+const HEX_LINE: usize = 79;
+
+/// Time limit for a minimal diff; then it approximates.
+const DIFF_TIME: Duration = Duration::from_millis(100);
 
 /// Payload display format. `Auto` detects the format per message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,38 +69,83 @@ pub fn render(payload: &[u8], view: View) -> String {
 
 /// Formats a `hexdump -C` style dump without the trailing offset line.
 fn hex(payload: &[u8]) -> String {
-    let lines: Vec<String> = payload
-        .chunks(16)
-        .enumerate()
-        .map(|(i, line)| {
-            let mut out = format!("{:08x}  ", i * 16);
-            for j in 0..16 {
-                // Missing bytes are padded so the ascii column lines up.
-                let _ = match line.get(j) {
-                    Some(b) => write!(out, "{b:02x} "),
-                    None => write!(out, "   "),
-                };
-                if j == 7 {
-                    out.push(' ');
-                }
+    let mut out = String::with_capacity(payload.len().div_ceil(16) * HEX_LINE);
+    for (i, line) in payload.chunks(16).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = write!(out, "{:08x}  ", i * 16);
+        for j in 0..16 {
+            // Missing bytes are padded so the ascii column lines up.
+            let _ = match line.get(j) {
+                Some(b) => write!(out, "{b:02x} "),
+                None => write!(out, "   "),
+            };
+            if j == 7 {
+                out.push(' ');
             }
-            let ascii: String = line
-                .iter()
-                .map(|&b| match b {
-                    b' '..=b'~' => b as char,
-                    _ => '.',
-                })
-                .collect();
-            let _ = write!(out, " |{ascii}|");
-            out
-        })
-        .collect();
-    lines.join("\n")
+        }
+        out.push_str(" |");
+        out.extend(line.iter().map(|&b| match b {
+            b' '..=b'~' => b as char,
+            _ => '.',
+        }));
+        out.push('|');
+    }
+    out
 }
 
-/// Returns a single-line payload preview for a topic row.
+/// Returns the view to display the payload in within about `max` bytes of
+/// text. Payloads longer than `max` are not parsed as JSON, and `Auto` checks
+/// only their start for UTF-8.
+pub fn resolve(payload: &[u8], view: View, max: usize) -> View {
+    let long = payload.len() > max;
+    match view {
+        View::Auto if !long => detect(payload),
+        View::Auto if std::str::from_utf8(head(payload, max)).is_err() => View::Hex,
+        View::Auto => View::Text,
+        View::Json if long => View::Text,
+        view => view,
+    }
+}
+
+/// Renders the start of the payload in the [`resolve`]d `view`, processing only
+/// as much as fits in about `max` bytes of text. Returns the text and how many
+/// payload bytes it shows.
+pub fn render_prefix(payload: &[u8], view: View, max: usize) -> (String, usize) {
+    let view = resolve(payload, view, max);
+    let part = match view {
+        View::Hex => &payload[..payload.len().min(max / HEX_LINE * 16)],
+        View::Base64 => &payload[..payload.len().min(max / 4 * 3)],
+        View::Text => head(payload, max),
+        // JSON within `max`.
+        _ => payload,
+    };
+    (render(part, view), part.len())
+}
+
+/// Returns up to `max` bytes from the start of `payload`, backing off from a
+/// UTF-8 char that would be split.
+fn head(payload: &[u8], max: usize) -> &[u8] {
+    if payload.len() <= max {
+        return payload;
+    }
+    let mut end = max;
+    // At most three continuation bytes follow a char's first byte.
+    while end > 0 && max - end < 3 && payload[end] & 0xC0 == 0x80 {
+        end -= 1;
+    }
+    &payload[..end]
+}
+
+/// Returns a single-line payload preview for a topic row. Examines only the
+/// start of the payload, enough for `max` chars unless it is mostly whitespace.
 pub fn preview(payload: &[u8], max: usize) -> String {
-    let Ok(text) = std::str::from_utf8(payload) else {
+    if payload.is_empty() {
+        return "(empty)".into();
+    }
+    let start = head(payload, 8 * (max + 1));
+    let Ok(text) = std::str::from_utf8(start) else {
         return format!("<{} bytes>", payload.len());
     };
     // The words joined by single spaces, stopping one char past `max` so a
@@ -104,8 +156,11 @@ pub fn preview(payload: &[u8], max: usize) -> String {
         .skip(1)
         .take(max + 1)
         .collect();
-    if out.chars().count() > max {
+    let over = out.chars().count() > max;
+    if over {
         out.pop();
+    }
+    if over || start.len() < payload.len() {
         out.push('…');
     }
     out
@@ -154,11 +209,13 @@ pub enum Change {
     Removed,
 }
 
-/// Diffs two rendered messages, including unchanged lines.
+/// Diffs two rendered messages, including unchanged lines, within [`DIFF_TIME`].
 ///
 /// Render both with the same view; JSON rendering ignores object key order.
 pub fn diff(old: &str, new: &str) -> Vec<(Change, String)> {
-    TextDiff::from_lines(old, new)
+    TextDiff::configure()
+        .timeout(DIFF_TIME)
+        .diff_lines(old, new)
         .iter_all_changes()
         .map(|c| {
             let change = match c.tag() {
@@ -218,6 +275,36 @@ mod tests {
         assert_eq!(preview("héllo wörld".as_bytes(), 4), "héll…");
         assert_eq!(preview("héll".as_bytes(), 4), "héll");
         assert_eq!(preview(&[0xff, 0xfe, 0x00], 80), "<3 bytes>");
+        assert_eq!(preview(b"", 80), "(empty)");
+    }
+
+    #[test]
+    fn preview_examines_only_the_start() {
+        // 24 bytes are examined, ending inside an `é`.
+        let split = "a".to_owned() + &"é".repeat(100);
+        assert_eq!(preview(split.as_bytes(), 2), "aé…");
+        let mut late = b"on".to_vec();
+        late.extend([b' '; 30]);
+        late.push(0xff);
+        assert_eq!(preview(&late, 2), "on…");
+    }
+
+    #[test]
+    fn render_prefix_processes_only_what_fits() {
+        // Two whole hex lines.
+        let max = 2 * HEX_LINE + 10;
+        assert_eq!(resolve(&[0xff; 100], View::Auto, max), View::Hex);
+        let (text, shown) = render_prefix(&[0xff; 100], View::Hex, max);
+        assert_eq!((text.lines().count(), shown), (2, 32));
+        assert_eq!(render_prefix(&[0; 100], View::Base64, 8).1, 6);
+        // Long JSON shows as text, cut before a split char.
+        let json = "[\"é\"]".as_bytes();
+        assert_eq!(resolve(json, View::Auto, 3), View::Text);
+        assert_eq!(resolve(json, View::Json, 3), View::Text);
+        assert_eq!(render_prefix(json, View::Json, 3), ("[\"".into(), 2));
+        assert_eq!(resolve(json, View::Auto, usize::MAX), View::Json);
+        let all = render_prefix(br#"{"a":1}"#, View::Json, usize::MAX);
+        assert_eq!(all, ("{\n  \"a\": 1\n}".into(), 7));
     }
 
     #[test]

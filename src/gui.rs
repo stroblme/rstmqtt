@@ -16,7 +16,7 @@ use egui::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::mqtt::{Profile, Session, Shared, State, Version};
+use crate::mqtt::{Profile, Session, Shared, State, Subscribed, Version, check_filter};
 use crate::payload::{self, Change, Seg, View};
 use crate::tree::{Node, Props, ROOT, Tree};
 
@@ -62,6 +62,12 @@ const LIMIT: usize = 64 * 1024;
 const PREVIEW: usize = 120;
 /// Publish history length.
 const RECENT: usize = 20;
+/// Publish history size limit in bytes of text.
+const RECENT_BYTES: usize = 64 * 1024;
+/// Topic row rebuild interval while only messages change.
+// ponytail: each rebuild scans the whole tree; with 100k+ topics under steady
+// traffic, update the rows incrementally from the inserted topics instead.
+const REBUILD: Duration = Duration::from_millis(250);
 /// Messages kept per topic.
 const HISTORY: usize = 100;
 /// Message rate history length in seconds.
@@ -72,22 +78,30 @@ const INPUT: egui::Margin = egui::Margin::symmetric(8, 6);
 const COPY: &str = "🗐";
 const EDIT: &str = "✏";
 const PLUG: &str = "🔌";
+/// eframe's app id, which also names the settings directory.
+const APP: &str = "rstmqtt";
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
     profile: Profile,
+    /// Filters the last persistent session may still hold.
+    subscribed: Option<Subscribed>,
     view: View,
     /// Published messages, newest first.
     sent: Vec<Draft>,
+    /// Whether `sent` is saved; otherwise it is kept in memory only.
+    remember: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             profile: Profile::default(),
+            subscribed: None,
             view: View::Auto,
             sent: Vec::new(),
+            remember: true,
         }
     }
 }
@@ -105,8 +119,180 @@ struct Draft {
     user: Vec<(String, String)>,
 }
 
+impl Draft {
+    /// Bytes of text, counted against [`RECENT_BYTES`].
+    fn bytes(&self) -> usize {
+        let user: usize = self.user.iter().map(|(k, v)| k.len() + v.len()).sum();
+        self.topic.len() + self.payload.len() + self.content_type.len() + user
+    }
+}
+
+/// Adds `d` to the front of the publish history, dropping its duplicate and the
+/// oldest entries beyond [`RECENT`] or [`RECENT_BYTES`]. A draft over the byte
+/// limit by itself is not added.
+fn record(sent: &mut Vec<Draft>, d: Draft) {
+    sent.retain(|s| *s != d);
+    if d.bytes() > RECENT_BYTES {
+        return;
+    }
+    sent.insert(0, d);
+    sent.truncate(RECENT);
+    let mut total = 0;
+    let keep = sent
+        .iter()
+        .take_while(|s| {
+            total += s.bytes();
+            total <= RECENT_BYTES
+        })
+        .count();
+    sent.truncate(keep);
+}
+
+/// Connection modal state, committed only on connecting.
+struct Editing {
+    profile: Profile,
+    /// Copy of the password, sent only with this profile.
+    password: String,
+    /// Whether the password was cleared for a changed broker or username.
+    cleared: bool,
+    /// Why connecting was refused.
+    error: Option<String>,
+}
+
+impl Editing {
+    /// Clears the password the first time the broker or username differs from
+    /// `saved`, so one broker's password reaches another only if entered again.
+    fn forget(&mut self, saved: &Profile) {
+        fn id(p: &Profile) -> (&str, u16, &str, bool) {
+            (&p.host, p.port, &p.username, p.tls)
+        }
+        if !self.cleared && id(&self.profile) != id(saved) {
+            self.password.clear();
+            self.cleared = true;
+        }
+    }
+}
+
+/// Topic rows kept between frames, since building them scans the tree.
+#[derive(Default)]
+struct Rows {
+    list: Vec<(usize, usize)>,
+    /// Filter and tree change count the list was built for, and when.
+    filter: String,
+    changes: u64,
+    built: Option<Instant>,
+    /// Forces a rebuild, as after expanding, collapsing or removing topics, or a
+    /// new tree, since the list holds node ids.
+    stale: bool,
+}
+
+impl Rows {
+    /// Rebuilds the list when stale or the filter changed, or at most every
+    /// [`REBUILD`] while only the tree changed. Returns whether a tree change is
+    /// still to show.
+    fn update(&mut self, tree: &Tree, filter: &str) -> bool {
+        let changed = tree.changes() != self.changes;
+        let due = self.built.is_none_or(|t| t.elapsed() >= REBUILD);
+        if self.stale || filter != self.filter || (changed && due) {
+            self.list = tree.rows(filter);
+            self.filter = filter.to_owned();
+            self.changes = tree.changes();
+            self.built = Some(Instant::now());
+            self.stale = false;
+            return false;
+        }
+        changed
+    }
+}
+
+/// Display data of the shown message, kept while its key holds.
+struct Rendered {
+    /// Node, message number, view, diff and "Show all" it is for.
+    key: (usize, u64, View, bool, bool),
+    /// The view used, which resolves `Auto`.
+    view: View,
+    /// Rendered text, or diff lines; empty with `json`.
+    parts: Vec<(String, Color32)>,
+    /// Parsed JSON object or array for the tree, outside diffs.
+    json: Option<Value>,
+    /// What the display limit left out.
+    cut: Option<String>,
+}
+
+impl Rendered {
+    /// Renders message `i` of `node`, within [`LIMIT`] unless "Show all".
+    /// Diffs only messages shown in full.
+    fn new(node: &Node, i: usize, key: (usize, u64, View, bool, bool)) -> Self {
+        let (_, _, view, diff, all) = key;
+        let max = if all { usize::MAX } else { LIMIT };
+        let payload = &node.history[i].payload;
+        let view = payload::resolve(payload, view, max);
+        let old = (diff && i > 0).then(|| &node.history[i - 1].payload);
+        let json = (old.is_none() && view == View::Json)
+            .then(|| serde_json::from_slice::<Value>(payload).ok())
+            .flatten()
+            .filter(|v| v.is_object() || v.is_array());
+        if json.is_some() {
+            return Self {
+                key,
+                view,
+                parts: Vec::new(),
+                json,
+                cut: None,
+            };
+        }
+        let (text, shown) = payload::render_prefix(payload, view, max);
+        let mut cut = Vec::new();
+        if shown < payload.len() {
+            cut.push(format!(
+                "Showing {} of {}",
+                size(shown),
+                size(payload.len())
+            ));
+        }
+        let parts = match old.map(|old| (old.len(), payload::render_prefix(old, view, max))) {
+            Some((len, (old, old_shown))) if old_shown == len && shown == payload.len() => {
+                payload::diff(&old, &text)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, (change, line))| {
+                        let (sign, colour) = match change {
+                            Change::Same => (' ', pal::TEXT),
+                            Change::Added => ('+', pal::GOOD),
+                            Change::Removed => ('-', pal::BAD),
+                        };
+                        let newline = if k > 0 { "\n" } else { "" };
+                        (format!("{newline}{sign} {line}"), colour)
+                    })
+                    .collect()
+            }
+            Some(_) => {
+                cut.push("Too long to diff".into());
+                vec![(text, pal::TEXT)]
+            }
+            None => vec![(text, pal::TEXT)],
+        };
+        Self {
+            key,
+            view,
+            parts,
+            json: None,
+            cut: (!cut.is_empty()).then(|| cut.join(" · ")),
+        }
+    }
+}
+
 /// Runs the GUI until the window closes.
 pub fn run() -> eframe::Result {
+    // The settings hold the publish history, so only the user may read them.
+    // Errors leave eframe's defaults.
+    #[cfg(unix)]
+    if let Some(dir) = eframe::storage_dir(APP) {
+        use std::os::unix::fs::PermissionsExt;
+        let private = std::fs::Permissions::from_mode(0o700);
+        let _ =
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::set_permissions(&dir, private));
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 760.0])
@@ -114,7 +300,7 @@ pub fn run() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "rstmqtt",
+        APP,
         options,
         Box::new(|cc| {
             theme(&cc.egui_ctx);
@@ -206,17 +392,20 @@ struct App {
     /// Pending connect (`true`) or disconnect, deferred until the frame releases
     /// `shared` because ending a session locks it.
     pending: Option<bool>,
-    /// Profile being edited in the connection modal.
-    editing: Option<Profile>,
+    editing: Option<Editing>,
     /// Subtree path and retained topics awaiting confirmation to clear.
     confirm: Option<(String, Vec<String>)>,
     filter: String,
+    rows: Rows,
     selected: Option<usize>,
+    /// Topic of `selected`, which the selection follows to another node.
+    selected_path: String,
     /// Displayed message number, stable as new messages arrive; `None` follows
     /// the latest.
     entry: Option<u64>,
     diff: bool,
     show_all: bool,
+    rendered: Option<Rendered>,
     /// Scrolls the selection into view after keyboard navigation.
     scroll: bool,
     draft: Draft,
@@ -240,6 +429,8 @@ impl App {
             shared: Arc::new(Mutex::new(Shared {
                 tree: Tree::new(HISTORY),
                 state: State::Disconnected,
+                notes: Vec::new(),
+                subscribed: None,
             })),
             s,
             session: None,
@@ -248,10 +439,13 @@ impl App {
             editing: None,
             confirm: None,
             filter: String::new(),
+            rows: Rows::default(),
             selected: None,
+            selected_path: String::new(),
             entry: None,
             diff: false,
             show_all: false,
+            rendered: None,
             scroll: false,
             draft: Draft::default(),
             publish_error: None,
@@ -267,10 +461,25 @@ impl App {
         // Ends the old connection before the new one, which may reuse its client
         // id.
         self.session = None;
-        let session = Session::start(&self.s.profile, Some(&self.password), HISTORY, ctx.clone());
+        let session = match Session::start(
+            &self.s.profile,
+            Some(&self.password),
+            self.s.subscribed.as_ref(),
+            HISTORY,
+            ctx.clone(),
+        ) {
+            Ok(session) => session,
+            Err(e) => {
+                self.notify(e);
+                return;
+            }
+        };
         self.shared = session.shared.clone();
         self.session = Some(session);
         self.selected = None;
+        // Node ids of the old tree.
+        self.rows.stale = true;
+        self.rendered = None;
         self.counted = 0;
     }
 
@@ -287,9 +496,23 @@ impl App {
     fn select(&mut self, tree: &Tree, id: usize) {
         if self.selected != Some(id) {
             self.selected = Some(id);
+            self.selected_path = tree.path(id);
             self.entry = None;
             self.show_all = false;
-            self.draft.topic = tree.path(id);
+            self.draft.topic = self.selected_path.clone();
+        }
+    }
+
+    /// Follows the selected topic to its node, which a removal can change, or
+    /// deselects it once gone. Freed nodes are reused for other topics.
+    fn follow(&mut self, tree: &Tree) {
+        if self.selected.is_some() {
+            let id = tree.find(&self.selected_path);
+            if id != self.selected {
+                self.entry = None;
+                self.show_all = false;
+            }
+            self.selected = id;
         }
     }
 
@@ -340,12 +563,20 @@ impl App {
             let p = &self.s.profile;
             let host = RichText::new(format!("{}:{}", p.host, p.port));
             ui.label(host.family(semibold()).color(pal::TEXT));
+            if p.tls {
+                ui.label(muted("TLS"));
+            }
             ui.label(muted(match p.version {
                 Version::V311 => "MQTT 3.1.1",
                 Version::V5 => "MQTT 5",
             }));
             if ui.button(EDIT).on_hover_text("Edit connection").clicked() {
-                self.editing = Some(self.s.profile.clone());
+                self.editing = Some(Editing {
+                    profile: self.s.profile.clone(),
+                    password: self.password.clone(),
+                    cleared: false,
+                    error: None,
+                });
             }
             let (text, colour) = state_label(state);
             let action = match self.session {
@@ -353,7 +584,7 @@ impl App {
                 None => "connect",
             };
             let mut hover = format!("{text}, click to {action}");
-            if let State::Reconnecting(error) = state {
+            if let State::Reconnecting(error) | State::Failed(error) = state {
                 hover = format!("{hover}\n{error}");
             }
             let plug = ui.button(RichText::new(PLUG).color(colour));
@@ -375,6 +606,14 @@ impl App {
         );
         ui.horizontal(|ui| {
             ui.label(RichText::new(text).small().color(pal::MUTED));
+            if tree.dropped() > 0 {
+                let dropped = format!("· {} dropped", tree.dropped());
+                ui.label(RichText::new(dropped).small().color(pal::MUTED))
+                    .on_hover_text(
+                        "messages not kept: beyond 100,000 topic levels, or too large for \
+                         the 256 MiB memory limit even after evicting older messages",
+                    );
+            }
             if self.noted.elapsed() < NOTE {
                 ui.label(RichText::new(&self.note).small());
             }
@@ -409,24 +648,30 @@ impl App {
         if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
             filter.request_focus();
         }
-        let mut rows = tree.rows(&self.filter);
-        if self.keys(ui, tree, &rows) {
-            rows = tree.rows(&self.filter);
+        // Taken for the frame, so `keys` and the row closures can borrow `self`.
+        let mut rows = std::mem::take(&mut self.rows);
+        if rows.update(tree, &self.filter) {
+            ui.ctx().request_repaint_after(REBUILD);
+        }
+        if self.keys(ui, tree, &rows.list) {
+            rows.stale = true;
+            rows.update(tree, &self.filter);
         }
         let opened = !self.filter.is_empty();
         let read = &*tree;
         let mut toggle = None;
+        let mut remove = None;
         let mut fading = false;
         let body = egui::TextStyle::Body.resolve(ui.style());
         ui.spacing_mut().item_spacing.y = 0.0;
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(
             ui,
             ROW,
-            rows.len(),
+            rows.list.len(),
             |ui, range| {
                 // Where row 0 would be, drawn or not.
                 let top = ui.max_rect().top() - range.start as f32 * ROW;
-                for &(id, depth) in &rows[range] {
+                for &(id, depth) in &rows.list[range] {
                     let node = read.node(id);
                     let (rect, row) =
                         ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
@@ -495,12 +740,16 @@ impl App {
                     if row.double_clicked() {
                         toggle = Some(id);
                     }
-                    row.context_menu(|ui| self.row_menu(ui, read, id, connected));
+                    row.context_menu(|ui| {
+                        if self.row_menu(ui, read, id, connected) {
+                            remove = Some(id);
+                        }
+                    });
                 }
                 if std::mem::take(&mut self.scroll)
                     && let Some(i) = self
                         .selected
-                        .and_then(|s| rows.iter().position(|&(id, _)| id == s))
+                        .and_then(|s| rows.list.iter().position(|&(id, _)| id == s))
                 {
                     let y = top + i as f32 * ROW;
                     ui.scroll_to_rect(
@@ -513,7 +762,15 @@ impl App {
         if let Some(id) = toggle {
             let node = tree.node_mut(id);
             node.expanded = !node.expanded;
+            rows.stale = true;
         }
+        if let Some(id) = remove {
+            tree.remove(id);
+            rows.stale = true;
+            self.rendered = None;
+            self.follow(tree);
+        }
+        self.rows = rows;
         fading
     }
 
@@ -564,7 +821,8 @@ impl App {
         false
     }
 
-    fn row_menu(&mut self, ui: &mut Ui, tree: &Tree, id: usize, connected: bool) {
+    /// Returns whether "Remove from view" was clicked.
+    fn row_menu(&mut self, ui: &mut Ui, tree: &Tree, id: usize, connected: bool) -> bool {
         let node = tree.node(id);
         let topic = tree.path(id);
         if ui.button("Copy topic").clicked() {
@@ -589,7 +847,7 @@ impl App {
             .add_enabled(connected, egui::Button::new("Clear retained"))
             .clicked()
         {
-            self.clear(std::slice::from_ref(&topic));
+            self.clear(&topic);
         }
         if ui
             .add_enabled(
@@ -601,27 +859,23 @@ impl App {
             let topics = tree
                 .subtree(id)
                 .into_iter()
-                .filter(|&i| tree.node(i).history.iter().any(|m| m.retain))
+                .filter(|&i| tree.node(i).retained)
                 .map(|i| tree.path(i))
                 .collect();
             self.confirm = Some((topic, topics));
         }
+        ui.separator();
+        ui.button("Remove from view")
+            .on_hover_text("local only; topics come back with their next message")
+            .clicked()
     }
 
-    /// Publishes empty retained messages to clear topics via broker delivery.
-    fn clear(&mut self, topics: &[String]) {
+    /// Queues an empty retained message to clear `topic` via broker delivery.
+    fn clear(&mut self, topic: &str) {
         let Some(session) = &self.session else { return };
-        let errors: Vec<String> = topics
-            .iter()
-            .filter_map(|t| session.publish(t, Vec::new(), 0, true, None).err())
-            .collect();
-        let note = match errors.first() {
-            None => format!("Cleared {}", count(topics.len() as u64, "topic")),
-            Some(e) => format!(
-                "Cleared {} of {}: {e}",
-                topics.len() - errors.len(),
-                topics.len()
-            ),
+        let note = match session.publish(topic, Vec::new(), 0, true, None) {
+            Ok(()) => format!("Queued clear of {topic}"),
+            Err(e) => format!("Clear of {topic} not queued: {e}"),
         };
         self.notify(note);
     }
@@ -658,48 +912,32 @@ impl App {
                 }
             });
         });
-        let view = match self.s.view {
-            View::Auto => payload::detect(&msg.payload),
-            view => view,
+        let number = node.received - (node.history.len() - 1 - i) as u64;
+        let key = (id, number, self.s.view, self.diff, self.show_all);
+        let rendered = match self.rendered.take() {
+            Some(r) if r.key == key => r,
+            _ => Rendered::new(node, i, key),
         };
-        let text = payload::render(&msg.payload, view);
         egui::Frame::new()
             .fill(pal::SURFACE)
             .corner_radius(6)
             .inner_margin(GAP)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                // Hex lines are a fixed layout, so they scroll rather than wrap.
-                let wrap = view != View::Hex;
-                if self.diff && i > 0 {
-                    let old = payload::render(&node.history[i - 1].payload, view);
-                    let lines = payload::diff(&old, &text)
-                        .into_iter()
-                        .enumerate()
-                        .map(|(k, (change, line))| {
-                            let (sign, colour) = match change {
-                                Change::Same => (' ', pal::TEXT),
-                                Change::Added => ('+', pal::GOOD),
-                                Change::Removed => ('-', pal::BAD),
-                            };
-                            let newline = if k > 0 { "\n" } else { "" };
-                            (format!("{newline}{sign} {line}"), colour)
-                        })
-                        .collect();
-                    self.text_block(ui, lines, wrap);
-                } else if msg.payload.is_empty() {
+                if let Some(json) = &rendered.json {
+                    self.json_tree(ui, json, &mut Vec::new());
+                } else if rendered.parts.iter().all(|(t, _)| t.is_empty()) {
+                    // An empty payload, or a diff of two.
                     ui.label(muted("(empty)"));
-                } else if let Some(json) = (view == View::Json
-                    && (self.show_all || text.len() <= LIMIT))
-                    .then(|| serde_json::from_slice::<Value>(&msg.payload).ok())
-                    .flatten()
-                    .filter(|v| v.is_object() || v.is_array())
-                {
-                    self.json_tree(ui, &json, &mut Vec::new());
                 } else {
-                    self.text_block(ui, vec![(text, pal::TEXT)], wrap);
+                    // Hex lines are a fixed layout, so they scroll rather than wrap.
+                    self.text_block(ui, &rendered.parts, rendered.view != View::Hex);
+                }
+                if let Some(cut) = &rendered.cut {
+                    self.show_all_row(ui, cut);
                 }
             });
+        self.rendered = Some(rendered);
 
         let mut meta = vec![format!("QoS {}", msg.qos)];
         if msg.retain {
@@ -779,11 +1017,11 @@ impl App {
     }
 
     /// Displays selectable monospace text, capped at [`LIMIT`] bytes until "Show all".
-    fn text_block(&mut self, ui: &mut Ui, parts: Vec<(String, Color32)>, wrap: bool) {
+    fn text_block(&mut self, ui: &mut Ui, parts: &[(String, Color32)], wrap: bool) {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let total: usize = parts.iter().map(|(t, _)| t.len()).sum();
         let mut job = LayoutJob::default();
-        for (text, colour) in &parts {
+        for (text, colour) in parts {
             let room = LIMIT.saturating_sub(job.text.len());
             let cut = !self.show_all && text.len() > room;
             let text = if cut {
@@ -806,13 +1044,18 @@ impl App {
                 .show(ui, |ui| ui.add(label.extend()));
         }
         if shown < total {
-            ui.horizontal(|ui| {
-                ui.label(muted(format!("Showing {} of {}", size(shown), size(total))));
-                if ui.button("Show all").clicked() {
-                    self.show_all = true;
-                }
-            });
+            self.show_all_row(ui, &format!("Showing {} of {}", size(shown), size(total)));
         }
+    }
+
+    /// Displays what the display limit left out, with a button to lift it.
+    fn show_all_row(&mut self, ui: &mut Ui, cut: &str) {
+        ui.horizontal(|ui| {
+            ui.label(muted(cut));
+            if ui.button("Show all").clicked() {
+                self.show_all = true;
+            }
+        });
     }
 
     /// Displays a collapsible JSON tree; right-click to copy paths or values.
@@ -949,23 +1192,32 @@ impl App {
                 }
                 let mut send = false;
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!self.s.sent.is_empty(), |ui| {
-                        egui::ComboBox::from_id_salt("recent")
-                            .selected_text("Recent")
-                            .width(80.0)
-                            .show_ui(ui, |ui| {
-                                for sent in &self.s.sent {
-                                    let text = format!(
-                                        "{}  {}",
-                                        sent.topic,
-                                        payload::preview(sent.payload.as_bytes(), 40)
-                                    );
-                                    if ui.selectable_label(false, text).clicked() {
-                                        *d = sent.clone();
-                                    }
+                    egui::ComboBox::from_id_salt("recent")
+                        .selected_text("Recent")
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for sent in &self.s.sent {
+                                let text = format!(
+                                    "{}  {}",
+                                    sent.topic,
+                                    payload::preview(sent.payload.as_bytes(), 40)
+                                );
+                                if ui.selectable_label(false, text).clicked() {
+                                    *d = sent.clone();
                                 }
-                            });
-                    });
+                            }
+                            if !self.s.sent.is_empty() {
+                                ui.separator();
+                            }
+                            ui.checkbox(&mut self.s.remember, "Remember publish history")
+                                .on_hover_text(
+                                    "saved with the settings; otherwise kept until the app closes",
+                                );
+                            let clear = egui::Button::new("Clear history");
+                            if ui.add_enabled(!self.s.sent.is_empty(), clear).clicked() {
+                                self.s.sent.clear();
+                            }
+                        });
                     if ui.button("Format JSON").clicked() {
                         match serde_json::from_str::<Value>(&d.payload)
                             .and_then(|v| serde_json::to_string_pretty(&v))
@@ -1011,17 +1263,22 @@ impl App {
         match sent {
             Ok(()) => {
                 self.publish_error = None;
-                self.notify(format!("Published to {}", d.topic));
-                self.s.sent.retain(|s| *s != d);
-                self.s.sent.insert(0, d);
-                self.s.sent.truncate(RECENT);
+                self.notify(format!("Queued to {}", d.topic));
+                record(&mut self.s.sent, d);
             }
             Err(e) => self.publish_error = Some(e),
         }
     }
 
     fn connection_modal(&mut self, ctx: &egui::Context) {
-        let Some(p) = &mut self.editing else { return };
+        let Some(e) = &mut self.editing else { return };
+        e.forget(&self.s.profile);
+        let Editing {
+            profile: p,
+            password,
+            error,
+            ..
+        } = e;
         let modal = modal(ctx, "connection").show(ctx, |ui| {
             ui.set_width(MODAL);
             heading(ui, "Connection");
@@ -1033,6 +1290,19 @@ impl App {
                     .desired_width(FIELD),
             );
             field(ui, "Port", egui::DragValue::new(&mut p.port));
+            ui.checkbox(&mut p.tls, "TLS")
+                .on_hover_text("verifies the broker's certificate and host name");
+            if p.tls {
+                field(
+                    ui,
+                    "CA file",
+                    TextEdit::singleline(&mut p.ca_file)
+                        .margin(INPUT)
+                        .hint_text("system roots")
+                        .desired_width(FIELD),
+                )
+                .on_hover_text("PEM file of the CA certificates to trust");
+            }
             ui.horizontal(|ui| {
                 ui.label("MQTT version");
                 ui.with_layout(right_to_left(), |ui| {
@@ -1058,18 +1328,26 @@ impl App {
             field(
                 ui,
                 "Password",
-                TextEdit::singleline(&mut self.password)
+                TextEdit::singleline(password)
                     .margin(INPUT)
                     .password(true)
                     .desired_width(FIELD),
             )
-            .on_hover_text("kept until the app closes, never saved");
+            .on_hover_text(
+                "kept until the app closes, never saved; cleared on changing the broker \
+                 or username",
+            );
             field(
                 ui,
                 "Keep alive",
                 egui::DragValue::new(&mut p.keep_alive).suffix(" s"),
             );
-            ui.checkbox(&mut p.clean, "Clean session");
+            ui.checkbox(&mut p.clean, "Clean session").on_hover_text(
+                "unchecked, the broker keeps the session (subscriptions and queued QoS 1 \
+                 and 2 messages) for this client id across disconnects; on MQTT 5 it never \
+                 expires unless the broker caps it. An empty client id always uses a clean \
+                 session.",
+            );
 
             ui.add_space(GAP);
             heading(ui, "Subscriptions");
@@ -1077,11 +1355,16 @@ impl App {
             for (i, (filter, level)) in p.subscriptions.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     let width = ui.available_width() - 110.0;
-                    ui.add(
+                    let invalid = check_filter(filter).err();
+                    let edit = ui.add(
                         TextEdit::singleline(filter)
                             .margin(INPUT)
+                            .text_color_opt(invalid.as_ref().map(|_| pal::BAD))
                             .desired_width(width),
                     );
+                    if let Some(invalid) = invalid {
+                        edit.on_hover_text(invalid);
+                    }
                     qos(ui, ("subscription", i), level);
                     if ui.button("−").clicked() {
                         remove = Some(i);
@@ -1094,6 +1377,9 @@ impl App {
             if ui.button("Add subscription").clicked() {
                 p.subscriptions.push((String::new(), 0));
             }
+            if let Some(error) = error {
+                ui.label(RichText::new(error.as_str()).small().color(pal::BAD));
+            }
 
             ui.add_space(GAP);
             right_row(ui, |ui| {
@@ -1103,9 +1389,20 @@ impl App {
             })
         });
         let (connect, cancel) = modal.inner;
-        if connect && let Some(profile) = self.editing.take() {
-            self.s.profile = profile;
-            self.pending = Some(true);
+        if connect && let Some(e) = self.editing.take() {
+            match e.profile.check(&e.password) {
+                Ok(()) => {
+                    self.s.profile = e.profile;
+                    self.password = e.password;
+                    self.pending = Some(true);
+                }
+                Err(error) => {
+                    self.editing = Some(Editing {
+                        error: Some(error),
+                        ..e
+                    })
+                }
+            }
         } else if cancel || modal.should_close() {
             self.editing = None;
         }
@@ -1123,8 +1420,10 @@ impl App {
                 count(topics.len() as u64, "topic")
             ));
             ui.label(muted(
-                "Only topics this client has received can be cleared. Retained \
-                 messages outside its subscriptions stay on the broker.",
+                "Covers topics that delivered a retained message to this client. On \
+                 MQTT 3.1.1, a retained message published after subscribing arrives \
+                 without the flag and is not included. Retained messages outside the \
+                 subscriptions stay on the broker.",
             ));
             ui.add_space(GAP);
             right_row(ui, |ui| {
@@ -1136,8 +1435,11 @@ impl App {
             })
         });
         let (clear, cancel) = modal.inner;
-        if clear && let Some((_, topics)) = self.confirm.take() {
-            self.clear(&topics);
+        if clear
+            && let Some((_, topics)) = self.confirm.take()
+            && let Some(session) = &self.session
+        {
+            session.clear(topics);
         } else if cancel || modal.should_close() {
             self.confirm = None;
         }
@@ -1197,6 +1499,7 @@ fn state_label(state: &State) -> (&'static str, Color32) {
         State::Connecting => ("connecting", pal::WARN),
         State::Connected => ("connected", pal::GOOD),
         State::Reconnecting(_) => ("reconnecting", pal::WARN),
+        State::Failed(_) => ("failed", pal::BAD),
         State::Disconnected => ("disconnected", pal::MUTED),
     }
 }
@@ -1232,9 +1535,19 @@ impl eframe::App for App {
         let shared = self.shared.clone();
         // Held for the whole frame, so the session task waits that long.
         let mut guard = shared.lock().unwrap();
-        let Shared { tree, state } = &mut *guard;
-        if self.selected.is_some_and(|id| !tree.contains(id)) {
-            self.selected = None;
+        let Shared {
+            tree,
+            state,
+            notes,
+            subscribed,
+        } = &mut *guard;
+        self.follow(tree);
+        if !notes.is_empty() {
+            self.notify(notes.join(" · "));
+            notes.clear();
+        }
+        if subscribed.is_some() {
+            self.s.subscribed = subscribed.take();
         }
         self.sample(tree);
         self.shortcuts(&ctx, tree);
@@ -1300,7 +1613,11 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let unsaved = (!self.s.remember).then(|| std::mem::take(&mut self.s.sent));
         eframe::set_value(storage, eframe::APP_KEY, &self.s);
+        if let Some(sent) = unsaved {
+            self.s.sent = sent;
+        }
     }
 }
 
@@ -1374,5 +1691,88 @@ mod tests {
         assert_eq!(shown(tree.node(a), Some(2)), Some(0));
         assert_eq!(shown(tree.node(a), Some(1)), Some(2));
         assert_eq!(shown(tree.node(ROOT), None), None);
+    }
+
+    #[test]
+    fn rows_rebuild_at_once_for_filter_or_stale_and_throttled_for_traffic() {
+        let mut tree = Tree::new(3);
+        let a = tree.insert("a", msg("1")).unwrap();
+        let mut rows = Rows::default();
+        assert!(!rows.update(&tree, ""));
+        assert_eq!(rows.list, [(a, 0)]);
+        let b = tree.insert("b", msg("2")).unwrap();
+        assert!(rows.update(&tree, ""), "waits during traffic");
+        assert_eq!(rows.list, [(a, 0)]);
+        assert!(!rows.update(&tree, "b"));
+        assert_eq!(rows.list, [(b, 0)]);
+        tree.remove(b);
+        rows.stale = true;
+        rows.update(&tree, "b");
+        assert!(rows.list.is_empty());
+        tree.insert("c", msg("3"));
+        rows.built = Instant::now().checked_sub(REBUILD);
+        assert!(!rows.update(&tree, ""));
+        assert_eq!(rows.list.len(), 2);
+    }
+
+    #[test]
+    fn rendered_bounds_text_and_diffs_only_whole_messages() {
+        let mut tree = Tree::new(3);
+        let a = tree.insert("a", msg("x")).unwrap();
+        let long = Message {
+            payload: vec![b'y'; 2 * LIMIT],
+            ..msg("")
+        };
+        tree.insert("a", long);
+        let r = Rendered::new(tree.node(a), 1, (a, 2, View::Auto, true, false));
+        assert_eq!(r.parts, [("y".repeat(LIMIT), pal::TEXT)]);
+        let cut = "Showing 64.0 KiB of 128.0 KiB · Too long to diff";
+        assert_eq!(r.cut.as_deref(), Some(cut));
+        let r = Rendered::new(tree.node(a), 1, (a, 2, View::Auto, true, true));
+        assert_eq!(r.parts.len(), 2, "one line removed, one added");
+        assert_eq!(r.cut, None);
+        let j = tree.insert("j", msg(r#"{"k":1}"#)).unwrap();
+        let r = Rendered::new(tree.node(j), 0, (j, 1, View::Auto, false, false));
+        assert!(r.json.is_some());
+    }
+
+    #[test]
+    fn password_is_cleared_once_for_another_broker() {
+        let saved = Profile::default();
+        let mut e = Editing {
+            profile: saved.clone(),
+            password: "pw".into(),
+            cleared: false,
+            error: None,
+        };
+        e.profile.keep_alive = 60;
+        e.forget(&saved);
+        assert_eq!(e.password, "pw", "same broker");
+        e.profile.port = 8883;
+        e.forget(&saved);
+        assert_eq!(e.password, "");
+        e.password = "new".into();
+        e.profile.username = "u".into();
+        e.forget(&saved);
+        assert_eq!(e.password, "new", "re-entered text stays");
+    }
+
+    #[test]
+    fn history_drops_the_oldest_beyond_the_byte_limit() {
+        let draft = |topic: &str, len| Draft {
+            topic: topic.into(),
+            payload: "x".repeat(len),
+            ..Draft::default()
+        };
+        let topics = |sent: &[Draft]| sent.iter().map(|d| d.topic.clone()).collect::<Vec<_>>();
+        let mut sent = Vec::new();
+        for topic in ["a", "b", "c"] {
+            record(&mut sent, draft(topic, 30_000));
+        }
+        assert_eq!(topics(&sent), ["c", "b"]);
+        record(&mut sent, draft("d", RECENT_BYTES));
+        assert_eq!(topics(&sent), ["c", "b"], "too large alone");
+        record(&mut sent, draft("b", 30_000));
+        assert_eq!(topics(&sent), ["b", "c"]);
     }
 }
