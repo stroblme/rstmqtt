@@ -473,12 +473,12 @@ impl App {
                     }];
                     if let Some(msg) = node.history.back() {
                         let value = payload::preview(&msg.payload, PREVIEW);
-                        parts.push((format!(" = {value}"), pal::MUTED));
+                        parts.push((format!(": {value}"), pal::MUTED));
                     }
                     if branch {
                         parts.push((
                             format!(
-                                "  ({}, {})",
+                                "  {} · {}",
                                 count(node.subtree_topics.into(), "topic"),
                                 count(node.subtree_messages, "message")
                             ),
